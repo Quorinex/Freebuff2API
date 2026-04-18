@@ -86,11 +86,11 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 	}
 }
 
-func (m *RunManager) Start(ctx context.Context) {
-	// Pre-warm runs for all tracked agents in background.
+func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
+	// Pre-warm runs for all free agents in background.
 	// The server is already listening; if a request arrives before
 	// pre-warming finishes, acquire() will lazily create the run.
-	go m.prewarm()
+	go m.prewarm(agentIDs)
 
 	m.wg.Add(1)
 	go func() {
@@ -115,12 +115,12 @@ func (m *RunManager) Start(ctx context.Context) {
 	}()
 }
 
-func (m *RunManager) prewarm() {
+func (m *RunManager) prewarm(agentIDs []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
 	defer cancel()
 
 	for _, pool := range m.pools {
-		for _, agentID := range trackedAgents {
+		for _, agentID := range agentIDs {
 			if err := pool.rotateAgent(ctx, agentID); err != nil {
 				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
 			} else {

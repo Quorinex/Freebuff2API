@@ -19,23 +19,20 @@ const (
 	modelRefreshInterval = 6 * time.Hour
 )
 
-// trackedAgents is the fixed set of agent IDs we manage runs for.
-var trackedAgents = []string{
-	"editor-lite",
-	"thinker-with-files-gemini",
-	"file-picker",
-	"file-picker-max",
-}
-
 // hardcodedFallback is used when the remote fetch fails on startup.
 var hardcodedFallback = map[string][]string{
-	"editor-lite":               {"z-ai/glm-5.1", "minimax/minimax-m2.7"},
-	"thinker-with-files-gemini": {"google/gemini-3.1-pro-preview"},
-	"file-picker":               {"google/gemini-2.5-flash-lite"},
-	"file-picker-max":           {"google/gemini-3.1-flash-lite-preview"},
+	"base2-free":         {"minimax/minimax-m2.7", "z-ai/glm-5.1"},
+	"file-picker":        {"google/gemini-2.5-flash-lite"},
+	"file-picker-max":    {"google/gemini-3.1-flash-lite-preview"},
+	"file-lister":        {"google/gemini-3.1-flash-lite-preview"},
+	"researcher-web":     {"google/gemini-3.1-flash-lite-preview"},
+	"researcher-docs":    {"google/gemini-3.1-flash-lite-preview"},
+	"basher":             {"google/gemini-3.1-flash-lite-preview"},
+	"editor-lite":        {"minimax/minimax-m2.7", "z-ai/glm-5.1"},
+	"code-reviewer-lite": {"minimax/minimax-m2.7", "z-ai/glm-5.1"},
 }
 
-// ModelRegistry fetches and caches the agent→model mapping for tracked agents
+// ModelRegistry fetches and caches the agent→model mapping for all free agents
 // from the upstream free-agents.ts source file.
 type ModelRegistry struct {
 	client *http.Client
@@ -117,6 +114,17 @@ func (r *ModelRegistry) AgentForModel(model string) (string, bool) {
 	return agent, ok
 }
 
+// AgentIDs returns the list of all known agent IDs.
+func (r *ModelRegistry) AgentIDs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make([]string, 0, len(r.agentModels))
+	for id := range r.agentModels {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func (r *ModelRegistry) refresh(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, freeAgentsSourceURL, nil)
 	if err != nil {
@@ -140,28 +148,20 @@ func (r *ModelRegistry) refresh(ctx context.Context) error {
 	}
 
 	all := parseAllFreeModels(string(body))
-
-	// Keep only tracked agents
-	filtered := make(map[string][]string)
-	for _, agentID := range trackedAgents {
-		if models, ok := all[agentID]; ok && len(models) > 0 {
-			filtered[agentID] = models
-		}
-	}
-	if len(filtered) == 0 {
-		return fmt.Errorf("no models found for any tracked agent in source")
+	if len(all) == 0 {
+		return fmt.Errorf("no free agents found in source")
 	}
 
-	modelToAgent, allModels := buildModelMapping(filtered)
+	modelToAgent, allModels := buildModelMapping(all)
 
 	r.mu.Lock()
-	r.agentModels = filtered
+	r.agentModels = all
 	r.modelToAgent = modelToAgent
 	r.allModels = allModels
 	r.lastOK = time.Now()
 	r.mu.Unlock()
 
-	r.logger.Printf("model registry: updated %d agents, %d models: %v", len(filtered), len(allModels), allModels)
+	r.logger.Printf("model registry: updated %d agents, %d models: %v", len(all), len(allModels), allModels)
 	return nil
 }
 

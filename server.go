@@ -45,7 +45,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) Start(ctx context.Context) {
-	s.runs.Start(ctx)
+	s.runs.Start(ctx, s.registry.AgentIDs())
 }
 
 func (s *Server) Shutdown(ctx context.Context) {
