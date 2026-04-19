@@ -1,6 +1,6 @@
 {
   "LISTEN_ADDR": ":8080",
-  "UPSTREAM_BASE_URL": "https://codebuff.com",
+  "UPSTREAM_BASE_URL": "https://www.codebuff.com",
   "AUTH_TOKENS": [],
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "15m",

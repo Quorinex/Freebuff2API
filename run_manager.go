@@ -28,14 +28,14 @@ type tokenPool struct {
 	client *UpstreamClient
 	logger *log.Logger
 
-	mu            sync.Mutex
-	runs          map[string]*managedRun // agentID → current run
-	draining      []*managedRun
-	session       *cachedSession
-	sessionRefreshCh chan struct{}
+	mu                      sync.Mutex
+	runs                    map[string]*managedRun // agentID → current run
+	draining                []*managedRun
+	session                 *cachedSession
+	sessionRefreshCh        chan struct{}
 	sessionRebuildScheduled bool
-	lastError     string
-	cooldownUntil time.Time
+	lastError               string
+	cooldownUntil           time.Time
 }
 
 type managedRun struct {
@@ -53,14 +53,14 @@ type runLease struct {
 }
 
 type tokenSnapshot struct {
-	Name          string        `json:"name"`
-	Runs          []runSnapshot `json:"runs"`
-	DrainingRuns  int           `json:"draining_runs"`
-	SessionStatus string        `json:"session_status,omitempty"`
-	SessionInstanceID string    `json:"session_instance_id,omitempty"`
-	SessionExpiresAt time.Time  `json:"session_expires_at,omitempty"`
-	CooldownUntil time.Time    `json:"cooldown_until,omitempty"`
-	LastError     string        `json:"last_error,omitempty"`
+	Name              string        `json:"name"`
+	Runs              []runSnapshot `json:"runs"`
+	DrainingRuns      int           `json:"draining_runs"`
+	SessionStatus     string        `json:"session_status,omitempty"`
+	SessionInstanceID string        `json:"session_instance_id,omitempty"`
+	SessionExpiresAt  time.Time     `json:"session_expires_at,omitempty"`
+	CooldownUntil     time.Time     `json:"cooldown_until,omitempty"`
+	LastError         string        `json:"last_error,omitempty"`
 }
 
 type runSnapshot struct {
@@ -226,8 +226,12 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 		}
 	}
 
-	if _, err := p.ensureSession(ctx); err != nil {
-		return nil, err
+	// Keep free-session refresh in the background, but do not block the
+	// request path on waiting-room queues. Upstream chat requests can then
+	// return the real reason quickly (for example free mode unavailable)
+	// instead of appearing to hang until the session becomes active.
+	if !p.hasReadySession() {
+		p.ensureSessionAsync("request path")
 	}
 
 	p.mu.Lock()
