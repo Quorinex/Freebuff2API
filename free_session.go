@@ -136,6 +136,25 @@ func (p *tokenPool) hasReadySession() bool {
 	return ready
 }
 
+func (p *tokenPool) sessionDebugState() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	status := "missing"
+	if p.session != nil {
+		status = string(p.session.status)
+	}
+	if p.sessionRefreshCh != nil {
+		status += "+refreshing"
+	}
+	if p.sessionRebuildScheduled {
+		status += "+scheduled"
+	}
+	if !p.cooldownUntil.IsZero() && time.Now().Before(p.cooldownUntil) {
+		status += "+cooldown"
+	}
+	return status
+}
+
 func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string, error) {
 	state, err := p.client.CreateOrRefreshSession(ctx, p.token)
 	if err != nil {

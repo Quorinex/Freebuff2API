@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+const (
+	readySessionAcquirePollInterval = time.Second
+	readySessionAcquireTimeout      = 30 * time.Second
+)
+
 type RunManager struct {
 	cfg    Config
 	logger *log.Logger
@@ -153,31 +158,65 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, er
 	}
 
 	startIndex := int(m.next.Add(1)-1) % len(m.pools)
+	waitCtx, cancel := context.WithTimeout(ctx, m.acquireWaitTimeout())
+	defer cancel()
+
+	var lastStatus string
+	for {
+		candidates, backgroundStates := m.collectAcquireCandidates(startIndex)
+		if len(candidates) > 0 {
+			var errs []string
+			for _, pool := range candidates {
+				lease, err := pool.acquire(waitCtx, agentID)
+				if err == nil {
+					return lease, nil
+				}
+				errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+			}
+
+			if len(backgroundStates) == 0 {
+				return nil, fmt.Errorf("unable to acquire run from any ready token (%s)", strings.Join(errs, "; "))
+			}
+			lastStatus = fmt.Sprintf("ready tokens failed (%s); warming=%s", strings.Join(errs, "; "), strings.Join(backgroundStates, ", "))
+		} else {
+			if len(backgroundStates) == 0 {
+				return nil, errors.New("no token has an active upstream free session")
+			}
+			lastStatus = "waiting for upstream free session (" + strings.Join(backgroundStates, ", ") + ")"
+		}
+
+		if err := sleepWithContext(waitCtx, readySessionAcquirePollInterval); err != nil {
+			if lastStatus == "" {
+				lastStatus = "waiting for upstream free session"
+			}
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf("timed out waiting for upstream free session after %s (%s)", m.acquireWaitTimeout().Round(time.Second), lastStatus)
+			}
+			return nil, fmt.Errorf("waiting for upstream free session canceled (%s)", lastStatus)
+		}
+	}
+}
+
+func (m *RunManager) collectAcquireCandidates(startIndex int) ([]*tokenPool, []string) {
 	candidates := make([]*tokenPool, 0, len(m.pools))
-	for pass := 0; pass < 2; pass++ {
-		for offset := 0; offset < len(m.pools); offset++ {
-			pool := m.pools[(startIndex+offset)%len(m.pools)]
-			ready := pool.hasReadySession()
-			if pass == 0 && !ready {
-				continue
-			}
-			if pass == 1 && ready {
-				continue
-			}
+	backgroundStates := make([]string, 0, len(m.pools))
+	for offset := 0; offset < len(m.pools); offset++ {
+		pool := m.pools[(startIndex+offset)%len(m.pools)]
+		if pool.hasReadySession() {
 			candidates = append(candidates, pool)
+			continue
 		}
+		pool.ensureSessionAsync("foreground wait")
+		backgroundStates = append(backgroundStates, fmt.Sprintf("%s=%s", pool.name, pool.sessionDebugState()))
 	}
+	return candidates, backgroundStates
+}
 
-	var errs []string
-	for _, pool := range candidates {
-		lease, err := pool.acquire(ctx, agentID)
-		if err == nil {
-			return lease, nil
-		}
-		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+func (m *RunManager) acquireWaitTimeout() time.Duration {
+	if m.cfg.RequestTimeout > 0 && m.cfg.RequestTimeout < readySessionAcquireTimeout {
+		return m.cfg.RequestTimeout
 	}
-
-	return nil, fmt.Errorf("unable to acquire run from any token (%s)", strings.Join(errs, "; "))
+	return readySessionAcquireTimeout
 }
 
 func (m *RunManager) Release(lease *runLease) {
@@ -226,8 +265,8 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 		}
 	}
 
-	if _, err := p.ensureSession(ctx); err != nil {
-		return nil, err
+	if !p.hasReadySession() {
+		return nil, errors.New("upstream free session not ready")
 	}
 
 	p.mu.Lock()

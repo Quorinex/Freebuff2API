@@ -42,9 +42,9 @@ func main() {
 	defer registry.Stop()
 
 	server := NewServer(cfg, logger, registry)
-	startCtx, cancelStart := context.WithTimeout(context.Background(), cfg.RequestTimeout)
-	server.Start(startCtx)
-	cancelStart()
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	server.Start(runCtx)
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -69,5 +69,6 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Printf("http shutdown error: %v", err)
 	}
+	cancelRun()
 	server.Shutdown(shutdownCtx)
 }

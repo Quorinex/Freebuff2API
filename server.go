@@ -55,6 +55,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(s.cfg.APIKeys) > 0 && !s.authorized(r) {
+			s.logger.Printf("request rejected: invalid proxy api key (%s %s)", r.Method, r.URL.Path)
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error", "")
 			return
 		}
@@ -122,6 +123,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logger.Printf("incoming chat request from %s", r.RemoteAddr)
+
 	requestBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error", "")
@@ -151,7 +154,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	for attempt := 0; attempt < 2; attempt++ {
 		lease, err := s.runs.Acquire(r.Context(), agentID)
 		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, "no healthy upstream auth token available", "server_error", "")
+			s.logger.Printf("chat acquire failed for model %s: %v", requestedModel, err)
+			writeOpenAIError(w, http.StatusBadGateway, err.Error(), "server_error", "")
 			return
 		}
 
