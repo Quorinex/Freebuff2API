@@ -207,6 +207,13 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 	cloned := cloneMap(payload)
 	cloned["model"] = requestedModel
 
+	// Normalize tool parameter schemas into a conservative subset the upstream
+	// backend can parse. This keeps LobeChat-style schemas working without
+	// changing non-tool requests.
+	if tools, ok := cloned["tools"].([]any); ok {
+		normalizeToolSchemas(tools)
+	}
+
 	metadata, ok := cloned["codebuff_metadata"].(map[string]any)
 	if !ok || metadata == nil {
 		metadata = make(map[string]any)
@@ -221,6 +228,259 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 		return nil, fmt.Errorf("marshal upstream request: %w", err)
 	}
 	return body, nil
+}
+
+// normalizeToolSchemas rewrites tool parameter schemas into a conservative JSON
+// Schema subset. Today that means resolving local $ref values and simplifying
+// common nullable constructs emitted by clients like LobeChat.
+func normalizeToolSchemas(tools []any) {
+	for _, tool := range tools {
+		toolMap, ok := tool.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := toolMap["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		params, ok := fn["parameters"].(map[string]any)
+		if !ok {
+			continue
+		}
+		fn["parameters"] = normalizeSchemaMap(params, extractDefinitions(params), 12)
+	}
+}
+
+// extractDefinitions returns the combined definitions map from "definitions" and "$defs".
+func extractDefinitions(schema map[string]any) map[string]any {
+	merged := make(map[string]any)
+	if d, ok := schema["definitions"].(map[string]any); ok {
+		for key, value := range d {
+			merged[key] = value
+		}
+	}
+	if d, ok := schema["$defs"].(map[string]any); ok {
+		for key, value := range d {
+			merged[key] = value
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func mergeDefinitions(parent, local map[string]any) map[string]any {
+	if len(parent) == 0 {
+		return local
+	}
+	if len(local) == 0 {
+		return parent
+	}
+	merged := make(map[string]any, len(parent)+len(local))
+	for key, value := range parent {
+		merged[key] = value
+	}
+	for key, value := range local {
+		merged[key] = value
+	}
+	return merged
+}
+
+func normalizeSchemaValue(value any, defs map[string]any, maxDepth int) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return normalizeSchemaMap(typed, defs, maxDepth)
+	case []any:
+		return normalizeSchemaSlice(typed, defs, maxDepth)
+	default:
+		return value
+	}
+}
+
+func normalizeSchemaMap(node map[string]any, defs map[string]any, maxDepth int) map[string]any {
+	if maxDepth <= 0 {
+		return cloneMap(node)
+	}
+
+	defs = mergeDefinitions(defs, extractDefinitions(node))
+	if replaced := tryResolveRef(node, defs); replaced != nil {
+		if replacedMap, ok := replaced.(map[string]any); ok {
+			return normalizeSchemaMap(replacedMap, defs, maxDepth-1)
+		}
+		return cloneMap(node)
+	}
+
+	normalized := make(map[string]any, len(node))
+	for key, value := range node {
+		normalized[key] = normalizeSchemaValue(value, defs, maxDepth-1)
+	}
+
+	delete(normalized, "definitions")
+	delete(normalized, "$defs")
+	delete(normalized, "nullable")
+
+	normalized = simplifyNullableCombinator(normalized, "anyOf")
+	normalized = simplifyNullableCombinator(normalized, "oneOf")
+	normalizeTypeField(normalized)
+	normalizeEnumField(normalized)
+	normalizeConstField(normalized)
+
+	return normalized
+}
+
+func normalizeSchemaSlice(slice []any, defs map[string]any, maxDepth int) []any {
+	if maxDepth <= 0 {
+		return cloneSlice(slice)
+	}
+	normalized := make([]any, len(slice))
+	for i, value := range slice {
+		normalized[i] = normalizeSchemaValue(value, defs, maxDepth-1)
+	}
+	return normalized
+}
+
+func simplifyNullableCombinator(schema map[string]any, key string) map[string]any {
+	rawOptions, ok := schema[key].([]any)
+	if !ok {
+		return schema
+	}
+
+	filtered := make([]any, 0, len(rawOptions))
+	for _, option := range rawOptions {
+		if optionMap, ok := option.(map[string]any); ok && isNullSchema(optionMap) {
+			continue
+		}
+		filtered = append(filtered, option)
+	}
+
+	if len(filtered) == 0 {
+		delete(schema, key)
+		return schema
+	}
+
+	if len(filtered) == 1 {
+		if optionMap, ok := filtered[0].(map[string]any); ok {
+			merged := make(map[string]any, len(schema)+len(optionMap))
+			for existingKey, existingValue := range schema {
+				if existingKey == key {
+					continue
+				}
+				merged[existingKey] = existingValue
+			}
+			for optionKey, optionValue := range optionMap {
+				merged[optionKey] = optionValue
+			}
+			return merged
+		}
+	}
+
+	schema[key] = filtered
+	return schema
+}
+
+func normalizeTypeField(schema map[string]any) {
+	rawType, ok := schema["type"]
+	if !ok {
+		return
+	}
+	if _, ok := rawType.(string); ok {
+		return
+	}
+	types, ok := rawType.([]any)
+	if !ok {
+		return
+	}
+	nonNullTypes := make([]string, 0, len(types))
+	for _, entry := range types {
+		typeName, ok := entry.(string)
+		if !ok || typeName == "null" || strings.TrimSpace(typeName) == "" {
+			continue
+		}
+		nonNullTypes = append(nonNullTypes, typeName)
+	}
+	switch len(nonNullTypes) {
+	case 0:
+		delete(schema, "type")
+	case 1:
+		schema["type"] = nonNullTypes[0]
+	default:
+		// Upstream expects a single primitive type. Keep the first non-null type
+		// rather than failing the whole request.
+		schema["type"] = nonNullTypes[0]
+	}
+}
+
+func normalizeEnumField(schema map[string]any) {
+	enumValues, ok := schema["enum"].([]any)
+	if !ok {
+		return
+	}
+	filtered := make([]any, 0, len(enumValues))
+	seen := make(map[string]struct{}, len(enumValues))
+	for _, entry := range enumValues {
+		if entry == nil {
+			continue
+		}
+		key := fmt.Sprintf("%T:%v", entry, entry)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		filtered = append(filtered, entry)
+	}
+	if len(filtered) == 0 {
+		delete(schema, "enum")
+		return
+	}
+	schema["enum"] = filtered
+}
+
+func normalizeConstField(schema map[string]any) {
+	if value, ok := schema["const"]; ok && value == nil {
+		delete(schema, "const")
+	}
+}
+
+func isNullSchema(schema map[string]any) bool {
+	if typeName, ok := schema["type"].(string); ok && typeName == "null" {
+		return true
+	}
+	if constValue, ok := schema["const"]; ok && constValue == nil {
+		return true
+	}
+	if enumValues, ok := schema["enum"].([]any); ok && len(enumValues) == 1 && enumValues[0] == nil {
+		return true
+	}
+	return false
+}
+
+// tryResolveRef checks if a node is a $ref object like {"$ref": "#/definitions/Foo"}
+// and returns the cloned definition if found.
+func tryResolveRef(node map[string]any, defs map[string]any) any {
+	ref, ok := node["$ref"].(string)
+	if !ok || len(node) != 1 {
+		return nil
+	}
+	// Support both "#/definitions/X" and "#/$defs/X"
+	var name string
+	if strings.HasPrefix(ref, "#/definitions/") {
+		name = strings.TrimPrefix(ref, "#/definitions/")
+	} else if strings.HasPrefix(ref, "#/$defs/") {
+		name = strings.TrimPrefix(ref, "#/$defs/")
+	}
+	if name == "" {
+		return nil
+	}
+	def, ok := defs[name]
+	if !ok {
+		return nil
+	}
+	// Clone to avoid mutating the original definition
+	if defMap, ok := def.(map[string]any); ok {
+		return cloneMap(defMap)
+	}
+	return def
 }
 
 func cloneMap(input map[string]any) map[string]any {
