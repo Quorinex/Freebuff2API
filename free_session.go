@@ -13,6 +13,7 @@ import (
 )
 
 const freeSessionPollInterval = 5 * time.Second
+const freeSessionRetryDelay = 10 * time.Second
 
 type sessionStatus string
 
@@ -75,8 +76,39 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 		p.sessionRefreshCh = nil
 		p.mu.Unlock()
 
+		if err == nil && session != nil && session.status == sessionStatusActive {
+			p.watchSessionExpiry(session.instanceID, session.expiresAt)
+		}
+
 		return instanceID, err
 	}
+}
+
+func (p *tokenPool) ensureSessionAsync(reason string) {
+	p.mu.Lock()
+	if now := time.Now(); now.Before(p.cooldownUntil) {
+		p.mu.Unlock()
+		return
+	}
+	if p.sessionRefreshCh != nil || p.sessionRebuildScheduled {
+		p.mu.Unlock()
+		return
+	}
+	p.sessionRebuildScheduled = true
+	p.mu.Unlock()
+
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			p.sessionRebuildScheduled = false
+			p.mu.Unlock()
+		}()
+
+		if reason != "" {
+			p.logger.Printf("%s: rebuilding free session in background (%s)", p.name, reason)
+		}
+		p.prewarmSession(context.Background())
+	}()
 }
 
 func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
@@ -95,6 +127,13 @@ func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func (p *tokenPool) hasReadySession() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ready := p.readySessionLocked(time.Now())
+	return ready
 }
 
 func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string, error) {
@@ -146,11 +185,13 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 
 func (p *tokenPool) invalidateSession(reason string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.session = nil
 	if reason != "" {
 		p.lastError = reason
 	}
+	p.mu.Unlock()
+
+	p.ensureSessionAsync(reason)
 }
 
 func (p *tokenPool) currentSessionInstanceID() string {
@@ -160,6 +201,67 @@ func (p *tokenPool) currentSessionInstanceID() string {
 		return ""
 	}
 	return p.session.instanceID
+}
+
+func (p *tokenPool) prewarmSession(ctx context.Context) {
+	for {
+		if _, err := p.ensureSession(ctx); err == nil {
+			return
+		} else {
+			p.logger.Printf("%s: session prewarm failed: %v", p.name, err)
+		}
+
+		if err := sleepWithContext(ctx, freeSessionRetryDelay); err != nil {
+			return
+		}
+	}
+}
+
+func (p *tokenPool) watchSessionExpiry(instanceID string, expiresAt time.Time) {
+	if instanceID == "" || expiresAt.IsZero() {
+		return
+	}
+
+	go func() {
+		if err := sleepWithContext(context.Background(), time.Until(expiresAt.Add(time.Second))); err != nil {
+			return
+		}
+
+		for {
+			p.mu.Lock()
+			current := p.session
+			if current == nil || current.status != sessionStatusActive || current.instanceID != instanceID {
+				p.mu.Unlock()
+				return
+			}
+			if p.hasInflightRequestsLocked() {
+				p.mu.Unlock()
+				if err := sleepWithContext(context.Background(), time.Second); err != nil {
+					return
+				}
+				continue
+			}
+			p.session = nil
+			p.mu.Unlock()
+
+			p.ensureSessionAsync("expired")
+			return
+		}
+	}()
+}
+
+func (p *tokenPool) hasInflightRequestsLocked() bool {
+	for _, run := range p.runs {
+		if run != nil && run.inflight > 0 {
+			return true
+		}
+	}
+	for _, run := range p.draining {
+		if run != nil && run.inflight > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *tokenPool) endSession(ctx context.Context) error {

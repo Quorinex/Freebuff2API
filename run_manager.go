@@ -33,6 +33,7 @@ type tokenPool struct {
 	draining      []*managedRun
 	session       *cachedSession
 	sessionRefreshCh chan struct{}
+	sessionRebuildScheduled bool
 	lastError     string
 	cooldownUntil time.Time
 }
@@ -95,7 +96,7 @@ func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
 	// Pre-warm runs for all free agents in background.
 	// The server is already listening; if a request arrives before
 	// pre-warming finishes, acquire() will lazily create the run.
-	go m.prewarm(agentIDs)
+	go m.prewarm(ctx, agentIDs)
 
 	m.wg.Add(1)
 	go func() {
@@ -120,13 +121,14 @@ func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
 	}()
 }
 
-func (m *RunManager) prewarm(agentIDs []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
+func (m *RunManager) prewarm(ctx context.Context, agentIDs []string) {
+	startupCtx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
 	defer cancel()
 
 	for _, pool := range m.pools {
+		go pool.prewarmSession(ctx)
 		for _, agentID := range agentIDs {
-			if err := pool.rotateAgent(ctx, agentID); err != nil {
+			if err := pool.rotateAgent(startupCtx, agentID); err != nil {
 				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
 			} else {
 				m.logger.Printf("%s: prewarmed %s", pool.name, agentID)
@@ -151,9 +153,23 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, er
 	}
 
 	startIndex := int(m.next.Add(1)-1) % len(m.pools)
+	candidates := make([]*tokenPool, 0, len(m.pools))
+	for pass := 0; pass < 2; pass++ {
+		for offset := 0; offset < len(m.pools); offset++ {
+			pool := m.pools[(startIndex+offset)%len(m.pools)]
+			ready := pool.hasReadySession()
+			if pass == 0 && !ready {
+				continue
+			}
+			if pass == 1 && ready {
+				continue
+			}
+			candidates = append(candidates, pool)
+		}
+	}
+
 	var errs []string
-	for offset := 0; offset < len(m.pools); offset++ {
-		pool := m.pools[(startIndex+offset)%len(m.pools)]
+	for _, pool := range candidates {
 		lease, err := pool.acquire(ctx, agentID)
 		if err == nil {
 			return lease, nil

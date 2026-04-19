@@ -157,14 +157,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
 
-		sessionInstanceID, err := lease.pool.ensureSession(r.Context())
-		if err != nil {
-			s.runs.Release(lease)
-			writeOpenAIError(w, http.StatusBadGateway, "failed to acquire upstream free session", "server_error", "")
-			return
-		}
-
-		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID)
+		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, lease.pool.currentSessionInstanceID())
 		if err != nil {
 			s.runs.Release(lease)
 			writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
