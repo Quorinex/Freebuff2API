@@ -151,13 +151,36 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	for attempt := 0; attempt < 2; attempt++ {
 		lease, err := s.runs.Acquire(r.Context(), agentID)
 		if err != nil {
+			var waitingErr *waitingRoomError
+			if errors.As(err, &waitingErr) {
+				if waitingErr.RetryAfter > 0 {
+					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
+				}
+				writeOpenAIError(w, http.StatusServiceUnavailable, waitingErr.Error(), "server_error", "waiting_room_queued")
+				return
+			}
 			writeOpenAIError(w, http.StatusBadGateway, "no healthy upstream auth token available", "server_error", "")
 			return
 		}
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
 
-		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, lease.pool.currentSessionInstanceID())
+		sessionInstanceID, err := lease.pool.ensureSession(r.Context())
+		if err != nil {
+			s.runs.Release(lease)
+			var waitingErr *waitingRoomError
+			if errors.As(err, &waitingErr) {
+				if waitingErr.RetryAfter > 0 {
+					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
+				}
+				writeOpenAIError(w, http.StatusServiceUnavailable, waitingErr.Error(), "server_error", "waiting_room_queued")
+				return
+			}
+			writeOpenAIError(w, http.StatusBadGateway, "failed to acquire upstream free session", "server_error", "")
+			return
+		}
+
+		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID)
 		if err != nil {
 			s.runs.Release(lease)
 			writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
