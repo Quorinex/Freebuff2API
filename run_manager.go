@@ -33,7 +33,6 @@ type tokenPool struct {
 	draining      []*managedRun
 	session       *cachedSession
 	sessionRefreshCh chan struct{}
-	sessionRebuildScheduled bool
 	lastError     string
 	cooldownUntil time.Time
 }
@@ -58,7 +57,10 @@ type tokenSnapshot struct {
 	DrainingRuns  int           `json:"draining_runs"`
 	SessionStatus string        `json:"session_status,omitempty"`
 	SessionInstanceID string    `json:"session_instance_id,omitempty"`
-	SessionExpiresAt time.Time  `json:"session_expires_at,omitempty"`
+	SessionExpiresAt  time.Time `json:"session_expires_at,omitempty"`
+	SessionPosition   int       `json:"session_position,omitempty"`
+	SessionQueueDepth int       `json:"session_queue_depth,omitempty"`
+	SessionPollAt     time.Time `json:"session_poll_at,omitempty"`
 	CooldownUntil time.Time    `json:"cooldown_until,omitempty"`
 	LastError     string        `json:"last_error,omitempty"`
 }
@@ -69,6 +71,35 @@ type runSnapshot struct {
 	StartedAt    time.Time `json:"started_at"`
 	Inflight     int       `json:"inflight"`
 	RequestCount int       `json:"request_count"`
+}
+
+type waitingRoomError struct {
+	Token      string
+	Position   int
+	QueueDepth int
+	RetryAfter time.Duration
+}
+
+func (e *waitingRoomError) Error() string {
+	if e == nil {
+		return "freebuff waiting room queued"
+	}
+
+	message := "freebuff waiting room queued"
+	if e.Token != "" {
+		message += " for " + e.Token
+	}
+	if e.Position > 0 {
+		if e.QueueDepth >= e.Position {
+			message += fmt.Sprintf(" (position %d/%d)", e.Position, e.QueueDepth)
+		} else {
+			message += fmt.Sprintf(" (position %d)", e.Position)
+		}
+	}
+	if e.RetryAfter > 0 {
+		message += fmt.Sprintf(", retry in about %s", e.RetryAfter.Round(time.Second))
+	}
+	return message
 }
 
 func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunManager {
@@ -96,7 +127,7 @@ func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
 	// Pre-warm runs for all free agents in background.
 	// The server is already listening; if a request arrives before
 	// pre-warming finishes, acquire() will lazily create the run.
-	go m.prewarm(ctx, agentIDs)
+	go m.prewarm(agentIDs)
 
 	m.wg.Add(1)
 	go func() {
@@ -121,14 +152,16 @@ func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
 	}()
 }
 
-func (m *RunManager) prewarm(ctx context.Context, agentIDs []string) {
-	startupCtx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
+func (m *RunManager) prewarm(agentIDs []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
 	defer cancel()
 
 	for _, pool := range m.pools {
-		go pool.prewarmSession(ctx)
+		if _, err := pool.ensureSession(ctx); err != nil {
+			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
+		}
 		for _, agentID := range agentIDs {
-			if err := pool.rotateAgent(startupCtx, agentID); err != nil {
+			if err := pool.rotateAgent(ctx, agentID); err != nil {
 				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
 			} else {
 				m.logger.Printf("%s: prewarmed %s", pool.name, agentID)
@@ -153,28 +186,31 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, er
 	}
 
 	startIndex := int(m.next.Add(1)-1) % len(m.pools)
-	candidates := make([]*tokenPool, 0, len(m.pools))
-	for pass := 0; pass < 2; pass++ {
-		for offset := 0; offset < len(m.pools); offset++ {
-			pool := m.pools[(startIndex+offset)%len(m.pools)]
-			ready := pool.hasReadySession()
-			if pass == 0 && !ready {
-				continue
-			}
-			if pass == 1 && ready {
-				continue
-			}
-			candidates = append(candidates, pool)
-		}
-	}
-
 	var errs []string
-	for _, pool := range candidates {
+	var waiting []*waitingRoomError
+	for offset := 0; offset < len(m.pools); offset++ {
+		pool := m.pools[(startIndex+offset)%len(m.pools)]
 		lease, err := pool.acquire(ctx, agentID)
 		if err == nil {
 			return lease, nil
 		}
+		var waitingErr *waitingRoomError
+		if errors.As(err, &waitingErr) {
+			waiting = append(waiting, waitingErr)
+		}
 		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
+	}
+
+	if len(waiting) == len(m.pools) && len(waiting) > 0 {
+		best := waiting[0]
+		for _, candidate := range waiting[1:] {
+			if candidate != nil && (best == nil || (candidate.Position > 0 && candidate.Position < best.Position)) {
+				best = candidate
+			}
+		}
+		if best != nil {
+			return nil, best
+		}
 	}
 
 	return nil, fmt.Errorf("unable to acquire run from any token (%s)", strings.Join(errs, "; "))
@@ -242,6 +278,10 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
+	if _, err := p.ensureSession(ctx); err != nil {
+		p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
+	}
+
 	p.mu.Lock()
 	var toRotate []string
 	for agentID, run := range p.runs {
@@ -423,15 +463,18 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 	defer p.mu.Unlock()
 
 	snapshot := tokenSnapshot{
-		Name:          p.name,
-		DrainingRuns:  len(p.draining),
-		CooldownUntil: p.cooldownUntil,
-		LastError:     p.lastError,
+		Name:             p.name,
+		DrainingRuns:     len(p.draining),
+		CooldownUntil:    p.cooldownUntil,
+		LastError:        p.lastError,
 	}
 	if p.session != nil {
 		snapshot.SessionStatus = string(p.session.status)
 		snapshot.SessionInstanceID = p.session.instanceID
 		snapshot.SessionExpiresAt = p.session.expiresAt
+		snapshot.SessionPosition = p.session.position
+		snapshot.SessionQueueDepth = p.session.queueDepth
+		snapshot.SessionPollAt = p.session.pollAt
 	}
 	for agentID, run := range p.runs {
 		snapshot.Runs = append(snapshot.Runs, runSnapshot{

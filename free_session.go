@@ -13,7 +13,6 @@ import (
 )
 
 const freeSessionPollInterval = 5 * time.Second
-const freeSessionRetryDelay = 10 * time.Second
 
 type sessionStatus string
 
@@ -29,6 +28,8 @@ const (
 type freeSessionResponse struct {
 	Status                 string `json:"status"`
 	InstanceID             string `json:"instanceId"`
+	Position               int    `json:"position"`
+	QueueDepth             int    `json:"queueDepth"`
 	ExpiresAt              string `json:"expiresAt"`
 	RemainingMs            int64  `json:"remainingMs"`
 	EstimatedWaitMs        int64  `json:"estimatedWaitMs"`
@@ -40,6 +41,10 @@ type cachedSession struct {
 	status     sessionStatus
 	instanceID string
 	expiresAt  time.Time
+	position   int
+	queueDepth int
+	pollAt     time.Time
+	retryAfter time.Duration
 }
 
 func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
@@ -48,6 +53,10 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 		if instanceID, ready := p.readySessionLocked(time.Now()); ready {
 			p.mu.Unlock()
 			return instanceID, nil
+		}
+		if waitingErr := waitingRoomErrorFromSession(p.name, p.session, time.Now()); waitingErr != nil {
+			p.mu.Unlock()
+			return "", waitingErr
 		}
 		if ch := p.sessionRefreshCh; ch != nil {
 			p.mu.Unlock()
@@ -65,50 +74,28 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 		session, instanceID, err := p.refreshSession(ctx)
 
 		p.mu.Lock()
+		if session != nil {
+			p.session = session
+		}
 		if err != nil {
 			p.session = nil
 			p.lastError = err.Error()
+		} else if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
+			p.lastError = waitingErr.Error()
 		} else {
-			p.session = session
 			p.lastError = ""
 		}
 		close(p.sessionRefreshCh)
 		p.sessionRefreshCh = nil
 		p.mu.Unlock()
 
-		if err == nil && session != nil && session.status == sessionStatusActive {
-			p.watchSessionExpiry(session.instanceID, session.expiresAt)
+		if err == nil {
+			if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
+				return "", waitingErr
+			}
 		}
-
 		return instanceID, err
 	}
-}
-
-func (p *tokenPool) ensureSessionAsync(reason string) {
-	p.mu.Lock()
-	if now := time.Now(); now.Before(p.cooldownUntil) {
-		p.mu.Unlock()
-		return
-	}
-	if p.sessionRefreshCh != nil || p.sessionRebuildScheduled {
-		p.mu.Unlock()
-		return
-	}
-	p.sessionRebuildScheduled = true
-	p.mu.Unlock()
-
-	go func() {
-		defer func() {
-			p.mu.Lock()
-			p.sessionRebuildScheduled = false
-			p.mu.Unlock()
-		}()
-
-		if reason != "" {
-			p.logger.Printf("%s: rebuilding free session in background (%s)", p.name, reason)
-		}
-		p.prewarmSession(context.Background())
-	}()
 }
 
 func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
@@ -129,17 +116,25 @@ func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
 	return "", false
 }
 
-func (p *tokenPool) hasReadySession() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_, ready := p.readySessionLocked(time.Now())
-	return ready
-}
-
 func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string, error) {
-	state, err := p.client.CreateOrRefreshSession(ctx, p.token)
-	if err != nil {
-		return nil, "", fmt.Errorf("start free session: %w", err)
+	p.mu.Lock()
+	current := p.session
+	p.mu.Unlock()
+
+	var (
+		state freeSessionResponse
+		err   error
+	)
+	if current != nil && current.status == sessionStatusQueued && strings.TrimSpace(current.instanceID) != "" {
+		state, err = p.client.GetSession(ctx, p.token, current.instanceID)
+		if err != nil {
+			return nil, "", fmt.Errorf("poll free session: %w", err)
+		}
+	} else {
+		state, err = p.client.CreateOrRefreshSession(ctx, p.token)
+		if err != nil {
+			return nil, "", fmt.Errorf("start free session: %w", err)
+		}
 	}
 
 	for {
@@ -165,13 +160,15 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 			if instanceID == "" {
 				return nil, "", fmt.Errorf("free session queued response missing instanceId")
 			}
-			if err := sleepWithContext(ctx, queuedPollDelay(state)); err != nil {
-				return nil, "", err
-			}
-			state, err = p.client.GetSession(ctx, p.token, instanceID)
-			if err != nil {
-				return nil, "", fmt.Errorf("poll free session: %w", err)
-			}
+			delay := queuedPollDelay(state)
+			return &cachedSession{
+				status:     sessionStatusQueued,
+				instanceID: instanceID,
+				position:   maxInt(state.Position, 1),
+				queueDepth: maxInt(state.QueueDepth, maxInt(state.Position, 1)),
+				pollAt:     time.Now().Add(delay),
+				retryAfter: delay,
+			}, "", nil
 		case sessionStatusNone, sessionStatusEnded, sessionStatusSuperseded:
 			state, err = p.client.CreateOrRefreshSession(ctx, p.token)
 			if err != nil {
@@ -185,13 +182,11 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 
 func (p *tokenPool) invalidateSession(reason string) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.session = nil
 	if reason != "" {
 		p.lastError = reason
 	}
-	p.mu.Unlock()
-
-	p.ensureSessionAsync(reason)
 }
 
 func (p *tokenPool) currentSessionInstanceID() string {
@@ -203,65 +198,26 @@ func (p *tokenPool) currentSessionInstanceID() string {
 	return p.session.instanceID
 }
 
-func (p *tokenPool) prewarmSession(ctx context.Context) {
-	for {
-		if _, err := p.ensureSession(ctx); err == nil {
-			return
-		} else {
-			p.logger.Printf("%s: session prewarm failed: %v", p.name, err)
-		}
-
-		if err := sleepWithContext(ctx, freeSessionRetryDelay); err != nil {
-			return
+func waitingRoomErrorFromSession(token string, session *cachedSession, now time.Time) *waitingRoomError {
+	if session == nil || session.status != sessionStatusQueued {
+		return nil
+	}
+	if !session.pollAt.IsZero() && now.Before(session.pollAt) {
+		return &waitingRoomError{
+			Token:      token,
+			Position:   session.position,
+			QueueDepth: session.queueDepth,
+			RetryAfter: time.Until(session.pollAt),
 		}
 	}
+	return nil
 }
 
-func (p *tokenPool) watchSessionExpiry(instanceID string, expiresAt time.Time) {
-	if instanceID == "" || expiresAt.IsZero() {
-		return
+func maxInt(a, b int) int {
+	if a > b {
+		return a
 	}
-
-	go func() {
-		if err := sleepWithContext(context.Background(), time.Until(expiresAt.Add(time.Second))); err != nil {
-			return
-		}
-
-		for {
-			p.mu.Lock()
-			current := p.session
-			if current == nil || current.status != sessionStatusActive || current.instanceID != instanceID {
-				p.mu.Unlock()
-				return
-			}
-			if p.hasInflightRequestsLocked() {
-				p.mu.Unlock()
-				if err := sleepWithContext(context.Background(), time.Second); err != nil {
-					return
-				}
-				continue
-			}
-			p.session = nil
-			p.mu.Unlock()
-
-			p.ensureSessionAsync("expired")
-			return
-		}
-	}()
-}
-
-func (p *tokenPool) hasInflightRequestsLocked() bool {
-	for _, run := range p.runs {
-		if run != nil && run.inflight > 0 {
-			return true
-		}
-	}
-	for _, run := range p.draining {
-		if run != nil && run.inflight > 0 {
-			return true
-		}
-	}
-	return false
+	return b
 }
 
 func (p *tokenPool) endSession(ctx context.Context) error {
