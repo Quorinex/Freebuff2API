@@ -14,8 +14,8 @@ import (
 )
 
 type Server struct {
-	cfg     Config
-	logger  *log.Logger
+	cfg      Config
+	logger   *log.Logger
 	client   *UpstreamClient
 	runs     *RunManager
 	registry *ModelRegistry
@@ -27,8 +27,8 @@ func NewServer(cfg Config, logger *log.Logger, registry *ModelRegistry) *Server 
 	runManager := NewRunManager(cfg, client, logger)
 
 	return &Server{
-		cfg:     cfg,
-		logger:  logger,
+		cfg:      cfg,
+		logger:   logger,
 		client:   client,
 		runs:     runManager,
 		registry: registry,
@@ -41,6 +41,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("/v1/messages", s.handleClaudeMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.handleClaudeCountTokens)
 	return s.withMiddleware(mux)
 }
 
@@ -55,7 +57,11 @@ func (s *Server) Shutdown(ctx context.Context) {
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(s.cfg.APIKeys) > 0 && !s.authorized(r) {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error", "")
+			if isClaudeRequestPath(r.URL.Path) {
+				writeClaudeError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error")
+			} else {
+				writeOpenAIError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error", "")
+			}
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -63,6 +69,12 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) authorized(r *http.Request) bool {
+	if apiKey := strings.TrimSpace(r.Header.Get("x-api-key")); apiKey != "" {
+		if containsString(s.cfg.APIKeys, apiKey) {
+			return true
+		}
+	}
+
 	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
 	if authorization == "" {
 		return false
@@ -73,6 +85,10 @@ func (s *Server) authorized(r *http.Request) bool {
 	}
 	apiKey := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
 	return containsString(s.cfg.APIKeys, apiKey)
+}
+
+func isClaudeRequestPath(path string) bool {
+	return strings.HasPrefix(path, "/v1/messages")
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -140,13 +156,113 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "model is required", "invalid_request_error", "")
 		return
 	}
-	agentID, ok := s.registry.AgentForModel(requestedModel)
-	if !ok {
-		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), "invalid_request_error", "model_not_found")
+
+	s.proxyChatRequest(
+		w,
+		r,
+		payload,
+		requestedModel,
+		"invalid_request_error",
+		"server_error",
+		writeOpenAIError,
+		writePassthroughError,
+		writeOpenAISuccessResponse,
+	)
+}
+
+func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeClaudeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 		return
 	}
 
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeClaudeError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+		return
+	}
+
+	payload, requestedModel, stream, err := convertClaudeMessagesRequestToOpenAI(requestBody)
+	if err != nil {
+		writeClaudeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+
+	if _, ok := s.registry.AgentForModel(requestedModel); !ok {
+		writeClaudeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), "invalid_request_error")
+		return
+	}
+
+	s.proxyChatRequest(
+		w,
+		r,
+		payload,
+		requestedModel,
+		"invalid_request_error",
+		"api_error",
+		func(w http.ResponseWriter, statusCode int, message, errorType, _ string) {
+			writeClaudeError(w, statusCode, message, errorType)
+		},
+		writeClaudePassthroughError,
+		func(w http.ResponseWriter, resp *http.Response) error {
+			return writeClaudeSuccessResponse(w, resp, requestedModel, stream)
+		},
+	)
+}
+
+func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeClaudeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeClaudeError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+		return
+	}
+
+	payload, requestedModel, _, err := convertClaudeMessagesRequestToOpenAI(requestBody)
+	if err != nil {
+		writeClaudeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+
+	if !s.registry.HasModel(requestedModel) {
+		writeClaudeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), "invalid_request_error")
+		return
+	}
+
+	count, err := countOpenAIPayloadTokens(requestedModel, payload)
+	if err != nil {
+		s.logger.Printf("count_tokens failed for model %s: %v", requestedModel, err)
+		writeClaudeError(w, http.StatusBadGateway, "failed to estimate input tokens", "api_error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"input_tokens": count,
+	})
+}
+
+func (s *Server) proxyChatRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	payload map[string]any,
+	requestedModel string,
+	invalidRequestType string,
+	serverErrorType string,
+	writeError func(http.ResponseWriter, int, string, string, string),
+	writeUpstreamError func(http.ResponseWriter, int, []byte),
+	writeSuccess func(http.ResponseWriter, *http.Response) error,
+) {
 	startTime := time.Now()
+
+	agentID, ok := s.registry.AgentForModel(requestedModel)
+	if !ok {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), invalidRequestType, "model_not_found")
+		return
+	}
 
 	for attempt := 0; attempt < 2; attempt++ {
 		lease, err := s.runs.Acquire(r.Context(), agentID)
@@ -156,10 +272,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				if waitingErr.RetryAfter > 0 {
 					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
 				}
-				writeOpenAIError(w, http.StatusServiceUnavailable, waitingErr.Error(), "server_error", "waiting_room_queued")
+				writeError(w, http.StatusServiceUnavailable, waitingErr.Error(), serverErrorType, "waiting_room_queued")
 				return
 			}
-			writeOpenAIError(w, http.StatusBadGateway, "no healthy upstream auth token available", "server_error", "")
+			writeError(w, http.StatusBadGateway, "no healthy upstream auth token available", serverErrorType, "")
 			return
 		}
 
@@ -173,32 +289,30 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				if waitingErr.RetryAfter > 0 {
 					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
 				}
-				writeOpenAIError(w, http.StatusServiceUnavailable, waitingErr.Error(), "server_error", "waiting_room_queued")
+				writeError(w, http.StatusServiceUnavailable, waitingErr.Error(), serverErrorType, "waiting_room_queued")
 				return
 			}
-			writeOpenAIError(w, http.StatusBadGateway, "failed to acquire upstream free session", "server_error", "")
+			writeError(w, http.StatusBadGateway, "failed to acquire upstream free session", serverErrorType, "")
 			return
 		}
 
 		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID)
 		if err != nil {
 			s.runs.Release(lease)
-			writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+			writeError(w, http.StatusBadRequest, err.Error(), invalidRequestType, "")
 			return
 		}
 
 		resp, errorBody, err := s.client.ChatCompletions(r.Context(), lease.pool.token, upstreamBody)
 		if err != nil {
 			s.runs.Release(lease)
-			writeOpenAIError(w, http.StatusBadGateway, err.Error(), "server_error", "")
+			writeError(w, http.StatusBadGateway, err.Error(), serverErrorType, "")
 			return
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			defer resp.Body.Close()
-			copyHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			if err := copyResponseBody(w, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
+			if err := writeSuccess(w, resp); err != nil && !errors.Is(err, context.Canceled) {
 				s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.name, err)
 			}
 			s.logger.Printf("[%s] Request completed successfully in %v (status: %d)", lease.pool.name, time.Since(startTime).Round(time.Millisecond), resp.StatusCode)
@@ -227,11 +341,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		s.runs.Release(lease)
 		s.logger.Printf("[%s] upstream error response: %s", lease.pool.name, string(errorBody))
-		writePassthroughError(w, resp.StatusCode, errorBody)
+		writeUpstreamError(w, resp.StatusCode, errorBody)
 		return
 	}
 
-	writeOpenAIError(w, http.StatusBadGateway, "upstream run expired twice in a row", "server_error", "")
+	writeError(w, http.StatusBadGateway, "upstream run expired twice in a row", serverErrorType, "")
+}
+
+func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) error {
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	return copyResponseBody(w, resp.Body)
 }
 
 func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID, sessionInstanceID string) ([]byte, error) {

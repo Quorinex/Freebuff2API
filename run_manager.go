@@ -28,13 +28,13 @@ type tokenPool struct {
 	client *UpstreamClient
 	logger *log.Logger
 
-	mu            sync.Mutex
-	runs          map[string]*managedRun // agentID → current run
-	draining      []*managedRun
-	session       *cachedSession
+	mu               sync.Mutex
+	runs             map[string]*managedRun // agentID -> current run
+	draining         []*managedRun
+	session          *cachedSession
 	sessionRefreshCh chan struct{}
-	lastError     string
-	cooldownUntil time.Time
+	lastError        string
+	cooldownUntil    time.Time
 }
 
 type managedRun struct {
@@ -52,17 +52,17 @@ type runLease struct {
 }
 
 type tokenSnapshot struct {
-	Name          string        `json:"name"`
-	Runs          []runSnapshot `json:"runs"`
-	DrainingRuns  int           `json:"draining_runs"`
-	SessionStatus string        `json:"session_status,omitempty"`
-	SessionInstanceID string    `json:"session_instance_id,omitempty"`
-	SessionExpiresAt  time.Time `json:"session_expires_at,omitempty"`
-	SessionPosition   int       `json:"session_position,omitempty"`
-	SessionQueueDepth int       `json:"session_queue_depth,omitempty"`
-	SessionPollAt     time.Time `json:"session_poll_at,omitempty"`
-	CooldownUntil time.Time    `json:"cooldown_until,omitempty"`
-	LastError     string        `json:"last_error,omitempty"`
+	Name              string        `json:"name"`
+	Runs              []runSnapshot `json:"runs"`
+	DrainingRuns      int           `json:"draining_runs"`
+	SessionStatus     string        `json:"session_status,omitempty"`
+	SessionInstanceID string        `json:"session_instance_id,omitempty"`
+	SessionExpiresAt  time.Time     `json:"session_expires_at,omitempty"`
+	SessionPosition   int           `json:"session_position,omitempty"`
+	SessionQueueDepth int           `json:"session_queue_depth,omitempty"`
+	SessionPollAt     time.Time     `json:"session_poll_at,omitempty"`
+	CooldownUntil     time.Time     `json:"cooldown_until,omitempty"`
+	LastError         string        `json:"last_error,omitempty"`
 }
 
 type runSnapshot struct {
@@ -463,10 +463,10 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 	defer p.mu.Unlock()
 
 	snapshot := tokenSnapshot{
-		Name:             p.name,
-		DrainingRuns:     len(p.draining),
-		CooldownUntil:    p.cooldownUntil,
-		LastError:        p.lastError,
+		Name:          p.name,
+		DrainingRuns:  len(p.draining),
+		CooldownUntil: p.cooldownUntil,
+		LastError:     p.lastError,
 	}
 	if p.session != nil {
 		snapshot.SessionStatus = string(p.session.status)

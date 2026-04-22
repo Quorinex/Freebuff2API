@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,7 +59,7 @@ func loadConfig(configPath string) (Config, error) {
 
 	finalCfg := Config{
 		ListenAddr:       strings.TrimSpace(cfg.ListenAddr),
-		UpstreamBaseURL:  strings.TrimRight(strings.TrimSpace(cfg.UpstreamBaseURL), "/"),
+		UpstreamBaseURL:  normalizeUpstreamBaseURL(cfg.UpstreamBaseURL),
 		AuthTokens:       dedupeStrings(cfg.AuthTokens),
 		RotationInterval: rotationInterval,
 		RequestTimeout:   requestTimeout,
@@ -80,15 +81,31 @@ func loadConfig(configPath string) (Config, error) {
 		return Config{}, errors.New("REQUEST_TIMEOUT must be greater than zero")
 	}
 
-
-
 	return finalCfg, nil
+}
+
+func normalizeUpstreamBaseURL(raw string) string {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	if raw == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+
+	if strings.EqualFold(parsed.Host, "codebuff.com") {
+		parsed.Host = "www.codebuff.com"
+	}
+
+	return strings.TrimRight(parsed.String(), "/")
 }
 
 func loadRawConfig(configPath string) (rawConfig, error) {
 	cfg := rawConfig{
 		ListenAddr:       ":8080",
-		UpstreamBaseURL:  "https://codebuff.com",
+		UpstreamBaseURL:  "https://www.codebuff.com",
 		RotationInterval: "6h",
 		RequestTimeout:   "15m",
 	}
