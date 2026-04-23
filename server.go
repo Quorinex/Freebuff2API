@@ -14,33 +14,53 @@ import (
 )
 
 type Server struct {
-	cfg      Config
-	logger   *log.Logger
-	client   *UpstreamClient
-	runs     *RunManager
-	registry *ModelRegistry
+	cfgStore  *ConfigStore
+	logger    *log.Logger
+	client    *UpstreamClient
+	runs      *RunManager
+	registry  *ModelRegistry
 	responses *responseStore
-	started  time.Time
+	started   time.Time
+}
+
+type proxyErrorResponse struct {
+	StatusCode int
+	Message    string
+	ErrorType  string
+	Code       string
+	RetryAfter time.Duration
 }
 
 func NewServer(cfg Config, logger *log.Logger, registry *ModelRegistry) *Server {
-	client := NewUpstreamClient(cfg)
+	cfgStore := NewConfigStore(cfg)
+	client := NewUpstreamClient(cfgStore)
 	runManager := NewRunManager(cfg, client, logger)
 
 	return &Server{
-		cfg:      cfg,
-		logger:   logger,
-		client:   client,
-		runs:     runManager,
-		registry: registry,
+		cfgStore:  cfgStore,
+		logger:    logger,
+		client:    client,
+		runs:      runManager,
+		registry:  registry,
 		responses: newResponseStore(),
-		started:  time.Now(),
+		started:   time.Now(),
 	}
+}
+
+func (s *Server) ApplyConfig(cfg Config) {
+	current := s.cfgStore.Current()
+	if current.ListenAddr != "" && cfg.ListenAddr != current.ListenAddr {
+		s.logger.Printf("LISTEN_ADDR changed from %s to %s but requires restart; keeping current listener", current.ListenAddr, cfg.ListenAddr)
+		cfg.ListenAddr = current.ListenAddr
+	}
+	s.cfgStore.Update(cfg)
+	s.runs.ApplyConfig(cfg)
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/v1/responses", s.handleResponses)
@@ -59,11 +79,12 @@ func (s *Server) Shutdown(ctx context.Context) {
 
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.cfg.APIKeys) > 0 && !s.authorized(r) {
+		cfg := s.cfgStore.Current()
+		if len(cfg.APIKeys) > 0 && !s.authorized(r, cfg.APIKeys) {
 			if isClaudeRequestPath(r.URL.Path) {
-				writeClaudeError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error")
+				writeClaudeErrorDetailed(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error", "invalid_api_key")
 			} else {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error", "")
+				writeOpenAIError(w, http.StatusUnauthorized, "invalid proxy api key", "authentication_error", "invalid_api_key")
 			}
 			return
 		}
@@ -71,9 +92,9 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) authorized(r *http.Request) bool {
+func (s *Server) authorized(r *http.Request, apiKeys []string) bool {
 	if apiKey := strings.TrimSpace(r.Header.Get("x-api-key")); apiKey != "" {
-		if containsString(s.cfg.APIKeys, apiKey) {
+		if containsString(apiKeys, apiKey) {
 			return true
 		}
 	}
@@ -87,7 +108,7 @@ func (s *Server) authorized(r *http.Request) bool {
 		return false
 	}
 	apiKey := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
-	return containsString(s.cfg.APIKeys, apiKey)
+	return containsString(apiKeys, apiKey)
 }
 
 func isClaudeRequestPath(path string) bool {
@@ -101,12 +122,43 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]any{
-		"ok":          true,
-		"started_at":  s.started.UTC(),
-		"uptime_sec":  int(time.Since(s.started).Seconds()),
-		"token_state": s.runs.Snapshots(),
+		"ok":         true,
+		"started_at": s.started.UTC(),
+		"uptime_sec": int(time.Since(s.started).Seconds()),
+		"summary":    summarizeTokenSnapshots(s.runs.Snapshots()),
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
+		return
+	}
+
+	cfg := s.cfgStore.Current()
+	snapshots := s.runs.Snapshots()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"started_at":       s.started.UTC(),
+		"uptime_sec":       int(time.Since(s.started).Seconds()),
+		"summary":          summarizeTokenSnapshots(snapshots),
+		"available_models": s.registry.Models(),
+		"token_state":      snapshots,
+		"config": map[string]any{
+			"listen_addr":        cfg.ListenAddr,
+			"upstream_base_url":  cfg.UpstreamBaseURL,
+			"rotation_interval":  cfg.RotationInterval.String(),
+			"request_timeout":    cfg.RequestTimeout.String(),
+			"auth_token_count":   len(cfg.AuthTokens),
+			"api_key_count":      len(cfg.APIKeys),
+			"config_path":        cfg.ConfigPath,
+			"config_format":      cfg.ConfigFormat,
+			"auth_token_dir":     cfg.AuthTokenDir,
+			"loaded_at":          cfg.LoadedAt,
+			"hot_reload_enabled": cfg.ConfigPath != "" || cfg.AuthTokenDir != "",
+		},
+	})
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +294,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		"invalid_request_error",
 		"api_error",
 		func(w http.ResponseWriter, statusCode int, message, errorType, _ string) {
-			writeClaudeError(w, statusCode, message, errorType)
+			writeClaudeErrorDetailed(w, statusCode, message, errorType, "")
 		},
 		writeClaudePassthroughError,
 		func(w http.ResponseWriter, resp *http.Response) error {
@@ -298,6 +350,7 @@ func (s *Server) proxyChatRequest(
 	writeSuccess func(http.ResponseWriter, *http.Response) error,
 ) {
 	startTime := time.Now()
+	isClaude := isClaudeRequestPath(r.URL.Path)
 
 	agentID, ok := s.registry.AgentForModel(requestedModel)
 	if !ok {
@@ -305,7 +358,8 @@ func (s *Server) proxyChatRequest(
 		return
 	}
 
-	maxAttempts := len(s.cfg.AuthTokens) + 1
+	cfg := s.cfgStore.Current()
+	maxAttempts := len(cfg.AuthTokens) + 1
 	if maxAttempts < 2 {
 		maxAttempts = 2
 	}
@@ -313,15 +367,7 @@ func (s *Server) proxyChatRequest(
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		lease, err := s.runs.Acquire(r.Context(), agentID, requestedModel)
 		if err != nil {
-			var waitingErr *waitingRoomError
-			if errors.As(err, &waitingErr) {
-				if waitingErr.RetryAfter > 0 {
-					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
-				}
-				writeError(w, http.StatusServiceUnavailable, waitingErr.Error(), serverErrorType, "waiting_room_queued")
-				return
-			}
-			writeError(w, http.StatusBadGateway, "no healthy upstream auth token available", serverErrorType, "")
+			s.writeProxyError(w, isClaude, mapAcquireError(err, serverErrorType))
 			return
 		}
 
@@ -330,15 +376,7 @@ func (s *Server) proxyChatRequest(
 		sessionInstanceID, err := lease.pool.ensureSession(r.Context(), requestedModel)
 		if err != nil {
 			s.runs.Release(lease)
-			var waitingErr *waitingRoomError
-			if errors.As(err, &waitingErr) {
-				if waitingErr.RetryAfter > 0 {
-					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
-				}
-				writeError(w, http.StatusServiceUnavailable, waitingErr.Error(), serverErrorType, "waiting_room_queued")
-				return
-			}
-			writeError(w, http.StatusBadGateway, "failed to acquire upstream free session", serverErrorType, "")
+			s.writeProxyError(w, isClaude, mapSessionAcquireError(err, serverErrorType))
 			return
 		}
 
@@ -352,7 +390,13 @@ func (s *Server) proxyChatRequest(
 		resp, errorBody, err := s.client.ChatCompletions(r.Context(), lease.pool.token, upstreamBody)
 		if err != nil {
 			s.runs.Release(lease)
-			writeError(w, http.StatusBadGateway, err.Error(), serverErrorType, "")
+			s.logger.Printf("[%s] upstream request failed: %v", lease.pool.name, err)
+			s.writeProxyError(w, isClaude, proxyErrorResponse{
+				StatusCode: http.StatusBadGateway,
+				Message:    "upstream request failed",
+				ErrorType:  serverErrorType,
+				Code:       "upstream_request_failed",
+			})
 			return
 		}
 
@@ -402,11 +446,180 @@ func (s *Server) proxyChatRequest(
 
 		s.runs.Release(lease)
 		s.logger.Printf("[%s] upstream error response: %s", lease.pool.name, string(errorBody))
-		writeUpstreamError(w, resp.StatusCode, errorBody)
+		_ = writeUpstreamError
+		s.writeProxyError(w, isClaude, mapUpstreamProxyError(resp, errorBody, serverErrorType))
 		return
 	}
 
-	writeError(w, http.StatusBadGateway, "upstream run expired twice in a row", serverErrorType, "")
+	_ = writeError
+	s.writeProxyError(w, isClaude, proxyErrorResponse{
+		StatusCode: http.StatusServiceUnavailable,
+		Message:    "upstream session is still switching models",
+		ErrorType:  serverErrorType,
+		Code:       "session_switch_in_progress",
+		RetryAfter: 3 * time.Second,
+	})
+}
+
+func (s *Server) writeProxyError(w http.ResponseWriter, isClaude bool, response proxyErrorResponse) {
+	if response.StatusCode == 0 {
+		response.StatusCode = http.StatusBadGateway
+	}
+	if response.ErrorType == "" {
+		if isClaude {
+			response.ErrorType = normalizeClaudeErrorType(response.StatusCode, "")
+		} else {
+			response.ErrorType = "upstream_error"
+		}
+	}
+	if response.RetryAfter > 0 {
+		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", maxDuration(response.RetryAfter, time.Second).Seconds()))
+	}
+	if isClaude {
+		writeClaudeErrorDetailed(w, response.StatusCode, response.Message, response.ErrorType, response.Code)
+		return
+	}
+	writeOpenAIError(w, response.StatusCode, response.Message, response.ErrorType, response.Code)
+}
+
+func mapAcquireError(err error, serverErrorType string) proxyErrorResponse {
+	var waitingErr *waitingRoomError
+	if errors.As(err, &waitingErr) {
+		return proxyErrorResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "all free sessions are queued in the Freebuff waiting room",
+			ErrorType:  serverErrorType,
+			Code:       "waiting_room_queued",
+			RetryAfter: maxDuration(waitingErr.RetryAfter, time.Second),
+		}
+	}
+	var switchErr *modelSwitchError
+	if errors.As(err, &switchErr) {
+		return proxyErrorResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "upstream session is still switching models",
+			ErrorType:  serverErrorType,
+			Code:       "session_switch_in_progress",
+			RetryAfter: maxDuration(switchErr.RetryAfter, time.Second),
+		}
+	}
+	return proxyErrorResponse{
+		StatusCode: http.StatusServiceUnavailable,
+		Message:    "no healthy upstream auth token available",
+		ErrorType:  serverErrorType,
+		Code:       "token_pool_unavailable",
+		RetryAfter: 5 * time.Second,
+	}
+}
+
+func mapSessionAcquireError(err error, serverErrorType string) proxyErrorResponse {
+	var waitingErr *waitingRoomError
+	if errors.As(err, &waitingErr) {
+		return proxyErrorResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "all free sessions are queued in the Freebuff waiting room",
+			ErrorType:  serverErrorType,
+			Code:       "waiting_room_queued",
+			RetryAfter: maxDuration(waitingErr.RetryAfter, time.Second),
+		}
+	}
+	var switchErr *modelSwitchError
+	if errors.As(err, &switchErr) {
+		return proxyErrorResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "upstream session is still switching models",
+			ErrorType:  serverErrorType,
+			Code:       "session_switch_in_progress",
+			RetryAfter: maxDuration(switchErr.RetryAfter, time.Second),
+		}
+	}
+	return proxyErrorResponse{
+		StatusCode: http.StatusBadGateway,
+		Message:    "failed to acquire upstream free session",
+		ErrorType:  serverErrorType,
+		Code:       "token_pool_unavailable",
+	}
+}
+
+func mapUpstreamProxyError(resp *http.Response, errorBody []byte, serverErrorType string) proxyErrorResponse {
+	message, _, code := extractUpstreamError(errorBody)
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return proxyErrorResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "upstream auth token rejected the request",
+			ErrorType:  serverErrorType,
+			Code:       "upstream_auth_rejected",
+			RetryAfter: 30 * time.Minute,
+		}
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return proxyErrorResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "upstream rate limit reached",
+			ErrorType:  serverErrorType,
+			Code:       "upstream_rate_limited",
+			RetryAfter: maxDuration(retryAfterDuration(resp.Header.Get("Retry-After")), 30*time.Second),
+		}
+	case strings.TrimSpace(code) == "waiting_room_queued":
+		return proxyErrorResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "all free sessions are queued in the Freebuff waiting room",
+			ErrorType:  serverErrorType,
+			Code:       "waiting_room_queued",
+			RetryAfter: maxDuration(retryAfterDuration(resp.Header.Get("Retry-After")), 5*time.Second),
+		}
+	case strings.TrimSpace(code) == "session_model_mismatch":
+		return proxyErrorResponse{
+			StatusCode: http.StatusServiceUnavailable,
+			Message:    "upstream session is still switching models",
+			ErrorType:  serverErrorType,
+			Code:       "session_switch_in_progress",
+			RetryAfter: 3 * time.Second,
+		}
+	default:
+		if strings.TrimSpace(message) == "" {
+			message = "upstream request failed"
+		} else {
+			message = "upstream request failed"
+		}
+		return proxyErrorResponse{
+			StatusCode: http.StatusBadGateway,
+			Message:    message,
+			ErrorType:  serverErrorType,
+			Code:       "upstream_request_failed",
+		}
+	}
+}
+
+func summarizeTokenSnapshots(snapshots []tokenSnapshot) map[string]any {
+	summary := map[string]any{
+		"total_tokens":  len(snapshots),
+		"active":        0,
+		"queued":        0,
+		"disabled":      0,
+		"banned":        0,
+		"cooling_down":  0,
+		"idle":          0,
+		"healthy":       0,
+		"service_ready": false,
+	}
+
+	for _, snapshot := range snapshots {
+		state := snapshot.State
+		if state == "" {
+			state = classifyTokenState(snapshot)
+		}
+		if _, ok := summary[state]; ok {
+			summary[state] = summary[state].(int) + 1
+		}
+		if state == "active" || state == "idle" {
+			summary["healthy"] = summary["healthy"].(int) + 1
+			summary["service_ready"] = true
+		}
+	}
+
+	summary["message"] = fmt.Sprintf("%d healthy, %d queued, %d disabled", summary["healthy"], summary["queued"], summary["disabled"].(int)+summary["banned"].(int))
+	return summary
 }
 
 func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) error {

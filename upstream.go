@@ -14,26 +14,38 @@ import (
 )
 
 type UpstreamClient struct {
-	baseURL    string
+	cfgStore   *ConfigStore
 	httpClient *http.Client
-	userAgent  string
 }
 
-func NewUpstreamClient(cfg Config) *UpstreamClient {
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnCloseReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return err
+}
+
+func NewUpstreamClient(cfgStore *ConfigStore) *UpstreamClient {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if cfg.HTTPProxy != "" {
-		if proxyURL, err := url.Parse(cfg.HTTPProxy); err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		cfg := cfgStore.Current()
+		if strings.TrimSpace(cfg.HTTPProxy) == "" {
+			return nil, nil
 		}
+		return url.Parse(cfg.HTTPProxy)
 	}
 
 	return &UpstreamClient{
-		baseURL: cfg.UpstreamBaseURL,
+		cfgStore: cfgStore,
 		httpClient: &http.Client{
-			Timeout:   cfg.RequestTimeout,
 			Transport: transport,
 		},
-		userAgent: cfg.UserAgent,
 	}
 }
 
@@ -123,25 +135,39 @@ func (c *UpstreamClient) ChatCompletions(ctx context.Context, authToken string, 
 }
 
 func (c *UpstreamClient) doJSON(ctx context.Context, authToken, path string, body []byte) (*http.Response, error) {
-	requestURL, err := url.JoinPath(c.baseURL, path)
+	cfg := c.cfgStore.Current()
+	requestURL, err := url.JoinPath(cfg.UpstreamBaseURL, path)
 	if err != nil {
 		return nil, fmt.Errorf("build upstream url: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(body))
+	requestCtx, cancel := c.requestContext(ctx)
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, requestURL, bytes.NewReader(body))
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("User-Agent", cfg.UserAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("send upstream request: %w", err)
 	}
+	resp.Body = &cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
 	return resp, nil
+}
+
+func (c *UpstreamClient) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	cfg := c.cfgStore.Current()
+	if cfg.RequestTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, cfg.RequestTimeout)
 }
 
 func retryAfterDuration(headerValue string) time.Duration {

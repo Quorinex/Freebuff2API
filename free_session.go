@@ -50,6 +50,22 @@ type cachedSession struct {
 	retryAfter time.Duration
 }
 
+type modelSwitchError struct {
+	CurrentModel string
+	TargetModel  string
+	RetryAfter   time.Duration
+}
+
+func (e *modelSwitchError) Error() string {
+	if e == nil {
+		return "session switch in progress"
+	}
+	if e.CurrentModel == "" || e.TargetModel == "" {
+		return "session switch in progress"
+	}
+	return fmt.Sprintf("token is switching from %s to %s", e.CurrentModel, e.TargetModel)
+}
+
 func (p *tokenPool) ensureSession(ctx context.Context, model string) (string, error) {
 	model = strings.TrimSpace(model)
 	for {
@@ -266,13 +282,21 @@ func (p *tokenPool) prepareModel(ctx context.Context, model string) error {
 	for _, run := range p.runs {
 		if run.inflight > 0 {
 			p.mu.Unlock()
-			return fmt.Errorf("token is busy with model %s", currentModel)
+			return &modelSwitchError{
+				CurrentModel: currentModel,
+				TargetModel:  model,
+				RetryAfter:   3 * time.Second,
+			}
 		}
 	}
 	for _, run := range p.draining {
 		if run.inflight > 0 {
 			p.mu.Unlock()
-			return fmt.Errorf("token is busy with model %s", currentModel)
+			return &modelSwitchError{
+				CurrentModel: currentModel,
+				TargetModel:  model,
+				RetryAfter:   3 * time.Second,
+			}
 		}
 	}
 
@@ -400,18 +424,22 @@ func (c *UpstreamClient) GetSession(ctx context.Context, authToken, instanceID s
 }
 
 func (c *UpstreamClient) EndSession(ctx context.Context, authToken string) error {
-	requestURL, err := url.JoinPath(c.baseURL, "/api/v1/freebuff/session")
+	cfg := c.cfgStore.Current()
+	requestURL, err := url.JoinPath(cfg.UpstreamBaseURL, "/api/v1/freebuff/session")
 	if err != nil {
 		return fmt.Errorf("build free session url: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
+	requestCtx, cancel := c.requestContext(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodDelete, requestURL, nil)
 	if err != nil {
 		return fmt.Errorf("create free session delete request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("User-Agent", cfg.UserAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -430,7 +458,8 @@ func (c *UpstreamClient) EndSession(ctx context.Context, authToken string) error
 }
 
 func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken, instanceID, model string) (freeSessionResponse, error) {
-	requestURL, err := url.JoinPath(c.baseURL, "/api/v1/freebuff/session")
+	cfg := c.cfgStore.Current()
+	requestURL, err := url.JoinPath(cfg.UpstreamBaseURL, "/api/v1/freebuff/session")
 	if err != nil {
 		return freeSessionResponse{}, fmt.Errorf("build free session url: %w", err)
 	}
@@ -440,13 +469,16 @@ func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken
 		body = bytes.NewReader([]byte("{}"))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, requestURL, body)
+	requestCtx, cancel := c.requestContext(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, method, requestURL, body)
 	if err != nil {
 		return freeSessionResponse{}, fmt.Errorf("create free session request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("User-Agent", cfg.UserAgent)
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
 		if strings.TrimSpace(model) != "" {

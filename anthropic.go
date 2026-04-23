@@ -1356,14 +1356,18 @@ func mapOpenAIFinishReasonToClaude(reason string) string {
 func writeClaudePassthroughError(w http.ResponseWriter, statusCode int, body []byte) {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) > 0 && json.Valid(trimmed) {
-		message, errorType, _ := extractUpstreamError(trimmed)
-		writeClaudeError(w, statusCode, message, normalizeClaudeErrorType(statusCode, errorType))
+		message, errorType, code := extractUpstreamError(trimmed)
+		writeClaudeErrorDetailed(w, statusCode, message, normalizeClaudeErrorType(statusCode, errorType), code)
 		return
 	}
-	writeClaudeError(w, statusCode, strings.TrimSpace(string(trimmed)), normalizeClaudeErrorType(statusCode, ""))
+	writeClaudeErrorDetailed(w, statusCode, strings.TrimSpace(string(trimmed)), normalizeClaudeErrorType(statusCode, ""), "")
 }
 
 func writeClaudeError(w http.ResponseWriter, statusCode int, message, errorType string) {
+	writeClaudeErrorDetailed(w, statusCode, message, errorType, "")
+}
+
+func writeClaudeErrorDetailed(w http.ResponseWriter, statusCode int, message, errorType, code string) {
 	if strings.TrimSpace(message) == "" {
 		message = http.StatusText(statusCode)
 	}
@@ -1371,13 +1375,17 @@ func writeClaudeError(w http.ResponseWriter, statusCode int, message, errorType 
 		errorType = normalizeClaudeErrorType(statusCode, "")
 	}
 
-	writeJSON(w, statusCode, map[string]any{
+	payload := map[string]any{
 		"type": "error",
 		"error": map[string]any{
 			"type":    errorType,
 			"message": message,
 		},
-	})
+	}
+	if strings.TrimSpace(code) != "" {
+		payload["error"].(map[string]any)["code"] = strings.TrimSpace(code)
+	}
+	writeJSON(w, statusCode, payload)
 }
 
 func normalizeClaudeErrorType(statusCode int, upstreamType string) string {

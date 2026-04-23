@@ -56,13 +56,14 @@ Only the `authToken` value is needed — copy it as your **AUTH_TOKENS**.
 
 ## Configuration
 
-Configuration is managed via a JSON file and/or environment variables. The JSON keys and environment variable names are identical. By default the app looks for `config.json` in the working directory; use `-config` to specify another path.
+Configuration is managed via a YAML/JSON file and/or environment variables. The file keys and environment variable names are identical. By default the app looks for `config.yaml`, `config.yml`, then `config.json` in the working directory; use `-config` to specify another path.
 
 ```json
 {
   "LISTEN_ADDR": ":8080",
   "UPSTREAM_BASE_URL": "https://codebuff.com",
   "AUTH_TOKENS": ["eyJhb..."],
+  "AUTH_TOKEN_DIR": "tokens.d",
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "15m",
   "API_KEYS": [],
@@ -77,12 +78,18 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
 | `LISTEN_ADDR` | Proxy listen address (default `:8080`) |
 | `UPSTREAM_BASE_URL` | Freebuff backend URL (default `https://codebuff.com`) |
 | `AUTH_TOKENS` | Freebuff auth tokens (JSON array or comma-separated env var) |
+| `AUTH_TOKEN_DIR` | Optional directory of token files; plain text, JSON, and YAML token blobs are supported |
 | `ROTATION_INTERVAL` | Run rotation interval (default `6h`) |
 | `REQUEST_TIMEOUT` | Upstream request timeout (default `15m`) |
 | `API_KEYS` | Client API keys for proxy auth (empty = open access) |
 | `HTTP_PROXY` | HTTP proxy for outbound requests |
 
-Environment variables override JSON values when both are set.
+Environment variables provide startup defaults. When a config file is present, its values win on reload. `LISTEN_ADDR` still requires a process restart because the HTTP listener is already bound.
+
+### Runtime Status
+
+- `GET /healthz`: lightweight readiness summary
+- `GET /status`: full token/session snapshot, config summary, and available models
 
 ## Deployment
 
