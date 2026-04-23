@@ -2,106 +2,136 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-Freebuff2API is an OpenAI-compatible proxy server for [Freebuff](https://freebuff.com). It translates standard OpenAI API requests into Freebuff's backend format, allowing you to use Freebuff's free models with any OpenAI-compatible client, SDK, or CLI tool.
+Freebuff2API is a compatibility-focused proxy for [Freebuff](https://freebuff.com). It translates client requests into the current Freebuff backend contract so you can expose a stable API to OpenAI-compatible clients, Claude-compatible clients, and tools that expect the OpenAI Responses API.
 
 ## Features
 
-- **OpenAI Compatible API** — Standard OpenAI endpoints; works with any compatible client out of the box.
-- **Freebuff Session Compatibility** — Preserves the current Freebuff waiting-room/session contract, including model-bound session selection and OpenAI-compatible request metadata.
-- **Multi-Token Rotation** — Cycle through multiple auth tokens with automatic periodic rotation.
-- **HTTP Proxy Support** — Route all outbound traffic through a configurable upstream proxy.
+- OpenAI-compatible `POST /v1/chat/completions`
+- OpenAI-compatible `POST /v1/responses`
+- Claude-compatible `POST /v1/messages`
+- Claude-compatible `POST /v1/messages/count_tokens`
+- `GET /v1/models` model discovery
+- Freebuff waiting-room and model-bound session handling
+- Stable retryable proxy errors such as `waiting_room_queued`, `session_switch_in_progress`, and `token_pool_unavailable`
+- Automatic token disabling when upstream reports a banned token
+- YAML/JSON config loading with runtime hot reload
+- Token directory loading via `AUTH_TOKEN_DIR`
+- Runtime diagnostics via `GET /healthz` and `GET /status`
+- Optional outbound HTTP proxy support
 
-## Getting Auth Tokens
+## Auth Tokens
 
-Freebuff2API requires one or more Freebuff **auth tokens**. There are two ways to obtain one:
+Freebuff2API needs one or more Freebuff auth tokens.
 
-### Method 1 — Web (Recommended)
+### Method 1: Web
 
-Visit **[https://freebuff.llm.pm](https://freebuff.llm.pm)**, log in with your Freebuff account, and your auth token will be displayed directly on the page. Copy it as your **AUTH_TOKENS** — no local installation required.
+Visit **[https://freebuff.llm.pm](https://freebuff.llm.pm)**, sign in with your Freebuff account, and copy the displayed auth token.
 
-### Method 2 — Freebuff CLI
+### Method 2: Freebuff CLI
 
-Install the Freebuff CLI:
+Install the CLI:
 
 ```bash
 npm i -g freebuff
 ```
 
-Run `freebuff` in your terminal — on first launch it will guide you through login.
-
-After logging in, your token is saved to a local credentials file:
+Run `freebuff` and finish the login flow. The token is then stored locally:
 
 | OS | Credentials Path |
 |---|---|
 | Windows | `C:\Users\<username>\.config\manicode\credentials.json` |
 | Linux / macOS | `~/.config/manicode/credentials.json` |
 
-The file looks like:
+Example:
 
 ```json
 {
   "default": {
-    "id": "user_10293847",
-    "name": "Zhang San",
-    "email": "zhangsan@example.com",
-    "authToken": "fa82b5c1-e39d-4c7a-961f-d2b3c4e5f6a7",
-    ...
+    "authToken": "fa82b5c1-e39d-4c7a-961f-d2b3c4e5f6a7"
   }
 }
 ```
 
-Only the `authToken` value is needed — copy it as your **AUTH_TOKENS**.
-
-> **Tip:** Log in with multiple accounts and configure all their tokens for higher throughput.
+Only the `authToken` value is required.
 
 ## Configuration
 
-Configuration is managed via a YAML/JSON file and/or environment variables. The file keys and environment variable names are identical. By default the app looks for `config.yaml`, `config.yml`, then `config.json` in the working directory; use `-config` to specify another path.
+The server accepts YAML or JSON config files. By default it looks for `config.yaml`, then `config.yml`, then `config.json` in the working directory. You can also pass a path with `-config`.
 
-```json
-{
-  "LISTEN_ADDR": ":8080",
-  "UPSTREAM_BASE_URL": "https://codebuff.com",
-  "AUTH_TOKENS": ["eyJhb..."],
-  "AUTH_TOKEN_DIR": "tokens.d",
-  "ROTATION_INTERVAL": "6h",
-  "REQUEST_TIMEOUT": "15m",
-  "API_KEYS": [],
-  "HTTP_PROXY": ""
-}
+Example:
+
+```yaml
+LISTEN_ADDR: ":8080"
+UPSTREAM_BASE_URL: "https://www.codebuff.com"
+AUTH_TOKENS:
+  - "token-1"
+  - "token-2"
+AUTH_TOKEN_DIR: "tokens.d"
+ROTATION_INTERVAL: "6h"
+REQUEST_TIMEOUT: "15m"
+API_KEYS: []
+HTTP_PROXY: ""
 ```
 
 ### Reference
 
 | Key / Env Var | Description |
 |---|---|
-| `LISTEN_ADDR` | Proxy listen address (default `:8080`) |
-| `UPSTREAM_BASE_URL` | Freebuff backend URL (default `https://codebuff.com`) |
-| `AUTH_TOKENS` | Freebuff auth tokens (JSON array or comma-separated env var) |
-| `AUTH_TOKEN_DIR` | Optional directory of token files; plain text, JSON, and YAML token blobs are supported |
-| `ROTATION_INTERVAL` | Run rotation interval (default `6h`) |
-| `REQUEST_TIMEOUT` | Upstream request timeout (default `15m`) |
-| `API_KEYS` | Client API keys for proxy auth (empty = open access) |
-| `HTTP_PROXY` | HTTP proxy for outbound requests |
+| `LISTEN_ADDR` | Proxy listen address. Default: `:8080` |
+| `UPSTREAM_BASE_URL` | Upstream Freebuff backend URL. Default: `https://www.codebuff.com` |
+| `AUTH_TOKENS` | Inline auth tokens. JSON array in files, comma-separated in env |
+| `AUTH_TOKEN_DIR` | Optional directory of token files. Plain text, JSON, and YAML token blobs are supported |
+| `ROTATION_INTERVAL` | Run rotation interval. Default: `6h` |
+| `REQUEST_TIMEOUT` | Upstream request timeout. Default: `15m` |
+| `API_KEYS` | Optional client-facing API keys. Empty means open access |
+| `HTTP_PROXY` | Optional outbound HTTP proxy |
 
-Environment variables provide startup defaults. When a config file is present, its values win on reload. `LISTEN_ADDR` still requires a process restart because the HTTP listener is already bound.
+Notes:
 
-### Runtime Status
+- Environment variables provide startup defaults.
+- If a config file is loaded, runtime reloads use the file as the source of truth.
+- `LISTEN_ADDR` still requires a process restart because the HTTP listener is already bound.
+
+## Runtime Status
 
 - `GET /healthz`: lightweight readiness summary
-- `GET /status`: full token/session snapshot, config summary, and available models
+- `GET /status`: full token/session snapshot, active config summary, and available models
 
 ## Deployment
 
 ### Docker
 
-Pre-built multi-arch images are available on GHCR:
+Simple env-based run:
 
 ```bash
 docker run -d --name Freebuff2API \
   -p 8080:8080 \
   -e AUTH_TOKENS="token1,token2" \
   ghcr.io/quorinex/freebuff2api:latest
+```
+
+Recommended hot-reload setup:
+
+```bash
+mkdir -p runtime/tokens.d
+cat > runtime/config.yaml <<'EOF'
+LISTEN_ADDR: ":8080"
+UPSTREAM_BASE_URL: "https://www.codebuff.com"
+AUTH_TOKEN_DIR: "/runtime/tokens.d"
+ROTATION_INTERVAL: "6h"
+REQUEST_TIMEOUT: "15m"
+API_KEYS: []
+HTTP_PROXY: ""
+EOF
+
+printf '%s\n' 'token-1' > runtime/tokens.d/token-1.txt
+printf '%s\n' 'token-2' > runtime/tokens.d/token-2.txt
+
+docker run -d --name Freebuff2API \
+  -p 8080:8080 \
+  -v "$(pwd)/runtime:/runtime" \
+  ghcr.io/quorinex/freebuff2api:latest \
+  -config /runtime/config.yaml
 ```
 
 Build from source:
@@ -113,24 +143,20 @@ docker run -d -p 8080:8080 -e AUTH_TOKENS="token1,token2" Freebuff2API
 
 ### Build from Source
 
-**Requirements:** Go 1.23+
+Requirements: Go 1.23+
 
 ```bash
 git clone https://github.com/Quorinex/Freebuff2API.git
 cd Freebuff2API
 go build -o Freebuff2API .
-./Freebuff2API -config config.json
+./Freebuff2API -config config.yaml
 ```
-
-## Links
-
-- [linux.do](https://linux.do)
 
 ## Disclaimer
 
-This project has no official affiliation with OpenAI, Codebuff, or Freebuff. All related trademarks and copyrights belong to their respective owners.
+This project is not affiliated with OpenAI, Codebuff, or Freebuff. All related trademarks belong to their respective owners.
 
-All contents within this repository are provided solely for communication, experimentation, and learning, and do not constitute production-ready services or professional advice. This project is provided on an "As-Is" basis, and users must use it at their own risk. The author assumes no liability for any direct or indirect damages resulting from the use, modification, or distribution of this project, nor provides any warranties of any kind, express or implied.
+This repository is provided for communication, experimentation, and learning. It is not production advice and is provided on an "as-is" basis. Use it at your own risk.
 
 ## License
 
