@@ -119,7 +119,9 @@ func convertResponsesCreateRequestToOpenAI(body []byte, store *responseStore) (m
 
 	if reasoning := mapValue(root["reasoning"]); reasoning != nil {
 		if effort := strings.TrimSpace(stringValue(reasoning["effort"])); effort != "" {
-			payload["reasoning_effort"] = effort
+			if normalized, ok := normalizeReasoningEffort(effort); ok {
+				payload["reasoning_effort"] = normalized
+			}
 		}
 	}
 

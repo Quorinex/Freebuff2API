@@ -57,7 +57,9 @@ func convertClaudeMessagesRequestToOpenAI(body []byte) (map[string]any, string, 
 	}
 
 	if reasoningEffort, ok := mapClaudeThinkingToReasoningEffort(root); ok {
-		out["reasoning_effort"] = reasoningEffort
+		if normalized, normalizedOK := normalizeReasoningEffort(reasoningEffort); normalizedOK {
+			out["reasoning_effort"] = normalized
+		}
 	}
 
 	messages := make([]any, 0, 8)
