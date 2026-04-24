@@ -9,28 +9,80 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
 	ListenAddr       string
 	UpstreamBaseURL  string
 	AuthTokens       []string
+	AuthTokenDir     string
 	RotationInterval time.Duration
 	RequestTimeout   time.Duration
 	UserAgent        string
 	APIKeys          []string
 	HTTPProxy        string
+	ConfigPath       string
+	ConfigFormat     string
+	LoadedAt         time.Time
 }
 
 type rawConfig struct {
-	ListenAddr       string   `json:"LISTEN_ADDR"`
-	UpstreamBaseURL  string   `json:"UPSTREAM_BASE_URL"`
-	AuthTokens       []string `json:"AUTH_TOKENS"`
-	RotationInterval string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout   string   `json:"REQUEST_TIMEOUT"`
-	APIKeys          []string `json:"API_KEYS"`
-	HTTPProxy        string   `json:"HTTP_PROXY"`
+	ListenAddr       string   `json:"LISTEN_ADDR" yaml:"LISTEN_ADDR"`
+	UpstreamBaseURL  string   `json:"UPSTREAM_BASE_URL" yaml:"UPSTREAM_BASE_URL"`
+	AuthTokens       []string `json:"AUTH_TOKENS" yaml:"AUTH_TOKENS"`
+	AuthTokenDir     string   `json:"AUTH_TOKEN_DIR" yaml:"AUTH_TOKEN_DIR"`
+	RotationInterval string   `json:"ROTATION_INTERVAL" yaml:"ROTATION_INTERVAL"`
+	RequestTimeout   string   `json:"REQUEST_TIMEOUT" yaml:"REQUEST_TIMEOUT"`
+	APIKeys          []string `json:"API_KEYS" yaml:"API_KEYS"`
+	HTTPProxy        string   `json:"HTTP_PROXY" yaml:"HTTP_PROXY"`
+}
+
+type ConfigStore struct {
+	current atomic.Value
+}
+
+func NewConfigStore(cfg Config) *ConfigStore {
+	store := &ConfigStore{}
+	store.Update(cfg)
+	return store
+}
+
+func (s *ConfigStore) Current() Config {
+	value := s.current.Load()
+	if value == nil {
+		return Config{}
+	}
+	return value.(Config)
+}
+
+func (s *ConfigStore) Update(cfg Config) {
+	s.current.Store(cfg)
+}
+
+func resolveConfigPath(configPath string) (string, error) {
+	if strings.TrimSpace(configPath) != "" {
+		resolved, err := filepath.Abs(strings.TrimSpace(configPath))
+		if err != nil {
+			return "", fmt.Errorf("resolve config path: %w", err)
+		}
+		return resolved, nil
+	}
+
+	for _, candidate := range []string{"config.yaml", "config.yml", "config.json"} {
+		if _, err := os.Stat(candidate); err == nil {
+			resolved, err := filepath.Abs(candidate)
+			if err != nil {
+				return "", fmt.Errorf("resolve config path: %w", err)
+			}
+			return resolved, nil
+		}
+	}
+
+	return "", nil
 }
 
 func loadConfig(configPath string) (Config, error) {
@@ -38,14 +90,6 @@ func loadConfig(configPath string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-
-	overrideString(&cfg.ListenAddr, "LISTEN_ADDR")
-	overrideString(&cfg.UpstreamBaseURL, "UPSTREAM_BASE_URL")
-	overrideString(&cfg.RotationInterval, "ROTATION_INTERVAL")
-	overrideString(&cfg.RequestTimeout, "REQUEST_TIMEOUT")
-	overrideCSV(&cfg.AuthTokens, "AUTH_TOKENS")
-	overrideCSV(&cfg.APIKeys, "API_KEYS")
-	overrideString(&cfg.HTTPProxy, "HTTP_PROXY")
 
 	rotationInterval, err := time.ParseDuration(strings.TrimSpace(cfg.RotationInterval))
 	if err != nil {
@@ -57,15 +101,37 @@ func loadConfig(configPath string) (Config, error) {
 		return Config{}, fmt.Errorf("parse request timeout: %w", err)
 	}
 
+	authTokenDir := strings.TrimSpace(cfg.AuthTokenDir)
+	if authTokenDir != "" && !filepath.IsAbs(authTokenDir) {
+		baseDir := "."
+		if strings.TrimSpace(configPath) != "" {
+			baseDir = filepath.Dir(configPath)
+		}
+		authTokenDir = filepath.Clean(filepath.Join(baseDir, authTokenDir))
+	}
+
+	authTokens := dedupeStrings(cfg.AuthTokens)
+	if tokenDir := authTokenDir; tokenDir != "" {
+		tokensFromDir, err := loadAuthTokensFromDir(tokenDir)
+		if err != nil {
+			return Config{}, fmt.Errorf("load auth tokens from dir: %w", err)
+		}
+		authTokens = dedupeStrings(append(authTokens, tokensFromDir...))
+	}
+
 	finalCfg := Config{
 		ListenAddr:       strings.TrimSpace(cfg.ListenAddr),
 		UpstreamBaseURL:  normalizeUpstreamBaseURL(cfg.UpstreamBaseURL),
-		AuthTokens:       dedupeStrings(cfg.AuthTokens),
+		AuthTokens:       authTokens,
+		AuthTokenDir:     authTokenDir,
 		RotationInterval: rotationInterval,
 		RequestTimeout:   requestTimeout,
 		UserAgent:        generateUserAgent(),
 		APIKeys:          dedupeStrings(cfg.APIKeys),
 		HTTPProxy:        strings.TrimSpace(cfg.HTTPProxy),
+		ConfigPath:       strings.TrimSpace(configPath),
+		ConfigFormat:     configFormat(configPath),
+		LoadedAt:         time.Now().UTC(),
 	}
 
 	switch {
@@ -110,21 +176,197 @@ func loadRawConfig(configPath string) (rawConfig, error) {
 		RequestTimeout:   "15m",
 	}
 
-	if configPath != "" {
-		path, err := filepath.Abs(configPath)
+	applyEnvConfig(&cfg)
+
+	if strings.TrimSpace(configPath) != "" {
+		overlay, err := parseConfigFile(configPath)
 		if err != nil {
-			return rawConfig{}, fmt.Errorf("resolve config path: %w", err)
+			return rawConfig{}, err
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return rawConfig{}, fmt.Errorf("read config file: %w", err)
+		mergeRawConfig(&cfg, overlay)
+	}
+
+	return cfg, nil
+}
+
+func parseConfigFile(configPath string) (rawConfig, error) {
+	path, err := filepath.Abs(configPath)
+	if err != nil {
+		return rawConfig{}, fmt.Errorf("resolve config path: %w", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return rawConfig{}, fmt.Errorf("read config file: %w", err)
+	}
+
+	var cfg rawConfig
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".yaml", ".yml":
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			return rawConfig{}, fmt.Errorf("parse config file: %w", err)
 		}
+	default:
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return rawConfig{}, fmt.Errorf("parse config file: %w", err)
 		}
 	}
 
 	return cfg, nil
+}
+
+func mergeRawConfig(dst *rawConfig, src rawConfig) {
+	if strings.TrimSpace(src.ListenAddr) != "" {
+		dst.ListenAddr = src.ListenAddr
+	}
+	if strings.TrimSpace(src.UpstreamBaseURL) != "" {
+		dst.UpstreamBaseURL = src.UpstreamBaseURL
+	}
+	if len(src.AuthTokens) > 0 {
+		dst.AuthTokens = src.AuthTokens
+	}
+	if strings.TrimSpace(src.AuthTokenDir) != "" {
+		dst.AuthTokenDir = src.AuthTokenDir
+	}
+	if strings.TrimSpace(src.RotationInterval) != "" {
+		dst.RotationInterval = src.RotationInterval
+	}
+	if strings.TrimSpace(src.RequestTimeout) != "" {
+		dst.RequestTimeout = src.RequestTimeout
+	}
+	if len(src.APIKeys) > 0 {
+		dst.APIKeys = src.APIKeys
+	}
+	if strings.TrimSpace(src.HTTPProxy) != "" {
+		dst.HTTPProxy = src.HTTPProxy
+	}
+}
+
+func applyEnvConfig(cfg *rawConfig) {
+	overrideString(&cfg.ListenAddr, "LISTEN_ADDR")
+	overrideString(&cfg.UpstreamBaseURL, "UPSTREAM_BASE_URL")
+	overrideString(&cfg.AuthTokenDir, "AUTH_TOKEN_DIR")
+	overrideString(&cfg.RotationInterval, "ROTATION_INTERVAL")
+	overrideString(&cfg.RequestTimeout, "REQUEST_TIMEOUT")
+	overrideCSV(&cfg.AuthTokens, "AUTH_TOKENS")
+	overrideCSV(&cfg.APIKeys, "API_KEYS")
+	overrideString(&cfg.HTTPProxy, "HTTP_PROXY")
+}
+
+func loadAuthTokensFromDir(dir string) ([]string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil, nil
+	}
+	resolved, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve auth token dir: %w", err)
+	}
+	entries, err := os.ReadDir(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("read auth token dir: %w", err)
+	}
+
+	tokens := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(resolved, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read auth token file %s: %w", path, err)
+		}
+		tokens = append(tokens, extractTokensFromBlob(path, data)...)
+	}
+
+	return dedupeStrings(tokens), nil
+}
+
+func extractTokensFromBlob(path string, data []byte) []string {
+	var decoded any
+	ext := strings.ToLower(filepath.Ext(path))
+
+	switch ext {
+	case ".yaml", ".yml":
+		if err := yaml.Unmarshal(data, &decoded); err == nil {
+			if tokens := collectAuthTokens(decoded); len(tokens) > 0 {
+				return dedupeStrings(tokens)
+			}
+		}
+	default:
+		if err := json.Unmarshal(data, &decoded); err == nil {
+			if tokens := collectAuthTokens(decoded); len(tokens) > 0 {
+				return dedupeStrings(tokens)
+			}
+		}
+		if err := yaml.Unmarshal(data, &decoded); err == nil {
+			if tokens := collectAuthTokens(decoded); len(tokens) > 0 {
+				return dedupeStrings(tokens)
+			}
+		}
+	}
+
+	return splitList(string(data))
+}
+
+func collectAuthTokens(value any) []string {
+	var tokens []string
+	collectAuthTokensInto(value, "", &tokens)
+	return dedupeStrings(tokens)
+}
+
+func collectAuthTokensInto(value any, key string, tokens *[]string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for childKey, childValue := range typed {
+			collectAuthTokensInto(childValue, childKey, tokens)
+		}
+	case map[any]any:
+		for rawKey, childValue := range typed {
+			collectAuthTokensInto(childValue, fmt.Sprint(rawKey), tokens)
+		}
+	case []any:
+		for _, childValue := range typed {
+			collectAuthTokensInto(childValue, key, tokens)
+		}
+	case []string:
+		if isAuthTokenListKey(key) {
+			*tokens = append(*tokens, compactStrings(typed)...)
+		}
+	case string:
+		if isAuthTokenScalarKey(key) {
+			*tokens = append(*tokens, strings.TrimSpace(typed))
+		}
+	}
+}
+
+func isAuthTokenScalarKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "authtoken", "auth_token", "token":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAuthTokenListKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "authtokens", "auth_tokens", "tokens":
+		return true
+	default:
+		return false
+	}
+}
+
+func configFormat(configPath string) string {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(configPath))) {
+	case ".yaml", ".yml":
+		return "yaml"
+	case ".json":
+		return "json"
+	default:
+		return ""
+	}
 }
 
 func overrideString(target *string, envName string) {
@@ -187,7 +429,7 @@ func generateUserAgent() string {
 }
 
 // generateClientSessionId generates a per-request session ID matching the
-// official SDK: Math.random().toString(36).substring(2, 15) — a ~13-char
+// official SDK: Math.random().toString(36).substring(2, 15) -> a ~13-char
 // base-36 alphanumeric string.
 func generateClientSessionId() string {
 	buf := make([]byte, 10)

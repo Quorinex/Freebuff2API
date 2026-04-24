@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"regexp"
 	"sort"
@@ -202,7 +201,7 @@ func parseAllFreeModels(source string) map[string][]string {
 }
 
 // buildModelMapping creates the model→agent reverse mapping and deduplicated model list.
-// When a model appears in multiple agents, one is chosen at random.
+// When a model appears in multiple agents, pick the least-used agent to spread traffic.
 func buildModelMapping(agentModels map[string][]string) (map[string]string, []string) {
 	modelAgents := make(map[string][]string)
 	for agentID, models := range agentModels {
@@ -213,10 +212,25 @@ func buildModelMapping(agentModels map[string][]string) (map[string]string, []st
 
 	modelToAgent := make(map[string]string, len(modelAgents))
 	allModels := make([]string, 0, len(modelAgents))
-	for model, agents := range modelAgents {
-		modelToAgent[model] = agents[rand.Intn(len(agents))]
+	for model := range modelAgents {
 		allModels = append(allModels, model)
 	}
 	sort.Strings(allModels)
+
+	agentUseCount := make(map[string]int, len(agentModels))
+	for _, model := range allModels {
+		agents := append([]string(nil), modelAgents[model]...)
+		sort.Strings(agents)
+		chosen := agents[0]
+		bestCount := agentUseCount[chosen]
+		for _, agentID := range agents[1:] {
+			if count := agentUseCount[agentID]; count < bestCount {
+				chosen = agentID
+				bestCount = count
+			}
+		}
+		modelToAgent[model] = chosen
+		agentUseCount[chosen]++
+	}
 	return modelToAgent, allModels
 }

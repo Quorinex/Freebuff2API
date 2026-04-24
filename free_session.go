@@ -28,6 +28,7 @@ const (
 type freeSessionResponse struct {
 	Status                 string `json:"status"`
 	InstanceID             string `json:"instanceId"`
+	Model                  string `json:"model"`
 	Position               int    `json:"position"`
 	QueueDepth             int    `json:"queueDepth"`
 	QueuedAt               string `json:"queuedAt"`
@@ -41,6 +42,7 @@ type freeSessionResponse struct {
 type cachedSession struct {
 	status     sessionStatus
 	instanceID string
+	model      string
 	expiresAt  time.Time
 	position   int
 	queueDepth int
@@ -48,16 +50,40 @@ type cachedSession struct {
 	retryAfter time.Duration
 }
 
-func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
+type modelSwitchError struct {
+	CurrentModel string
+	TargetModel  string
+	RetryAfter   time.Duration
+}
+
+func (e *modelSwitchError) Error() string {
+	if e == nil {
+		return "session switch in progress"
+	}
+	if e.CurrentModel == "" || e.TargetModel == "" {
+		return "session switch in progress"
+	}
+	return fmt.Sprintf("token is switching from %s to %s", e.CurrentModel, e.TargetModel)
+}
+
+func (p *tokenPool) ensureSession(ctx context.Context, model string) (string, error) {
+	model = strings.TrimSpace(model)
 	for {
 		p.mu.Lock()
-		if instanceID, ready := p.readySessionLocked(time.Now()); ready {
+		if instanceID, ready := p.readySessionLocked(time.Now(), model); ready {
 			p.mu.Unlock()
 			return instanceID, nil
 		}
-		if waitingErr := waitingRoomErrorFromSession(p.name, p.session, time.Now()); waitingErr != nil {
+		if waitingErr := waitingRoomErrorFromSession(p.name, p.session, time.Now()); waitingErr != nil && p.sessionMatchesModelLocked(model) {
 			p.mu.Unlock()
 			return "", waitingErr
+		}
+		if p.session != nil && !p.sessionMatchesModelLocked(model) {
+			p.mu.Unlock()
+			if err := p.prepareModel(ctx, model); err != nil {
+				return "", err
+			}
+			continue
 		}
 		if ch := p.sessionRefreshCh; ch != nil {
 			p.mu.Unlock()
@@ -72,7 +98,7 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 		p.sessionRefreshCh = ch
 		p.mu.Unlock()
 
-		session, instanceID, err := p.refreshSession(ctx)
+		session, instanceID, err := p.refreshSession(ctx, model)
 
 		p.mu.Lock()
 		if session != nil {
@@ -81,6 +107,9 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 		if err != nil {
 			p.session = nil
 			p.lastError = err.Error()
+			if isBannedErrorMessage(err.Error()) {
+				p.disabled = true
+			}
 		} else if waitingErr := waitingRoomErrorFromSession(p.name, session, time.Now()); waitingErr != nil {
 			p.lastError = waitingErr.Error()
 		} else {
@@ -99,8 +128,11 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 	}
 }
 
-func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
+func (p *tokenPool) readySessionLocked(now time.Time, model string) (string, bool) {
 	if p.session == nil {
+		return "", false
+	}
+	if !p.sessionMatchesModelLocked(model) {
 		return "", false
 	}
 	switch p.session.status {
@@ -117,7 +149,8 @@ func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
 	return "", false
 }
 
-func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string, error) {
+func (p *tokenPool) refreshSession(ctx context.Context, model string) (*cachedSession, string, error) {
+	model = strings.TrimSpace(model)
 	p.mu.Lock()
 	current := p.session
 	p.mu.Unlock()
@@ -132,7 +165,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 			return nil, "", fmt.Errorf("poll free session: %w", err)
 		}
 	} else {
-		state, err = p.client.CreateOrRefreshSession(ctx, p.token)
+		state, err = p.client.CreateOrRefreshSession(ctx, p.token, model)
 		if err != nil {
 			return nil, "", fmt.Errorf("start free session: %w", err)
 		}
@@ -141,7 +174,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 	for {
 		switch sessionStatus(strings.TrimSpace(state.Status)) {
 		case sessionStatusDisabled:
-			return &cachedSession{status: sessionStatusDisabled}, "", nil
+			return &cachedSession{status: sessionStatusDisabled, model: model}, "", nil
 		case sessionStatusActive:
 			instanceID := strings.TrimSpace(state.InstanceID)
 			if instanceID == "" {
@@ -154,6 +187,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 			return &cachedSession{
 				status:     sessionStatusActive,
 				instanceID: instanceID,
+				model:      firstNonEmptyTrimmedString(strings.TrimSpace(state.Model), model),
 				expiresAt:  expiresAt,
 			}, instanceID, nil
 		case sessionStatusQueued:
@@ -166,13 +200,14 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 			return &cachedSession{
 				status:     sessionStatusQueued,
 				instanceID: instanceID,
+				model:      firstNonEmptyTrimmedString(strings.TrimSpace(state.Model), model),
 				position:   maxInt(state.Position, 1),
 				queueDepth: maxInt(state.QueueDepth, maxInt(state.Position, 1)),
 				pollAt:     time.Now().Add(delay),
 				retryAfter: delay,
 			}, "", nil
 		case sessionStatusNone, sessionStatusEnded, sessionStatusSuperseded:
-			state, err = p.client.CreateOrRefreshSession(ctx, p.token)
+			state, err = p.client.CreateOrRefreshSession(ctx, p.token, model)
 			if err != nil {
 				return nil, "", fmt.Errorf("refresh free session: %w", err)
 			}
@@ -198,6 +233,101 @@ func (p *tokenPool) currentSessionInstanceID() string {
 		return ""
 	}
 	return p.session.instanceID
+}
+
+func (p *tokenPool) currentSessionModel() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.session == nil {
+		return ""
+	}
+	return p.session.model
+}
+
+func (p *tokenPool) sessionMatchesModelLocked(model string) bool {
+	if p.session == nil {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	if model == "" || strings.TrimSpace(p.session.model) == "" {
+		return true
+	}
+	return p.session.model == model
+}
+
+func (p *tokenPool) prepareModel(ctx context.Context, model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+
+	p.mu.Lock()
+	currentModel := ""
+	if p.session != nil {
+		currentModel = strings.TrimSpace(p.session.model)
+	}
+	if currentModel == "" {
+		for _, run := range p.runs {
+			if strings.TrimSpace(run.model) != "" {
+				currentModel = strings.TrimSpace(run.model)
+				break
+			}
+		}
+	}
+	if currentModel == "" || currentModel == model {
+		p.mu.Unlock()
+		return nil
+	}
+
+	for _, run := range p.runs {
+		if run.inflight > 0 {
+			p.mu.Unlock()
+			return &modelSwitchError{
+				CurrentModel: currentModel,
+				TargetModel:  model,
+				RetryAfter:   3 * time.Second,
+			}
+		}
+	}
+	for _, run := range p.draining {
+		if run.inflight > 0 {
+			p.mu.Unlock()
+			return &modelSwitchError{
+				CurrentModel: currentModel,
+				TargetModel:  model,
+				RetryAfter:   3 * time.Second,
+			}
+		}
+	}
+
+	session := p.session
+	var allRuns []*managedRun
+	for _, run := range p.runs {
+		allRuns = append(allRuns, run)
+	}
+	allRuns = append(allRuns, p.draining...)
+	p.runs = make(map[string]*managedRun)
+	p.draining = nil
+	p.session = nil
+	p.lastError = ""
+	p.lastModelSwitch = time.Now()
+	p.mu.Unlock()
+
+	var errs []string
+	for _, run := range allRuns {
+		if err := p.client.FinishRun(ctx, p.token, run.id, run.requestCount); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if session != nil && session.status != sessionStatusDisabled && session.instanceID != "" {
+		if err := p.client.EndSession(ctx, p.token); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("switch token from model %s to %s: %s", currentModel, model, strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func waitingRoomErrorFromSession(token string, session *cachedSession, now time.Time) *waitingRoomError {
@@ -286,27 +416,31 @@ func (p *tokenPool) endSession(ctx context.Context) error {
 	return nil
 }
 
-func (c *UpstreamClient) CreateOrRefreshSession(ctx context.Context, authToken string) (freeSessionResponse, error) {
-	return c.doSessionRequest(ctx, http.MethodPost, authToken, "")
+func (c *UpstreamClient) CreateOrRefreshSession(ctx context.Context, authToken, model string) (freeSessionResponse, error) {
+	return c.doSessionRequest(ctx, http.MethodPost, authToken, "", model)
 }
 
 func (c *UpstreamClient) GetSession(ctx context.Context, authToken, instanceID string) (freeSessionResponse, error) {
-	return c.doSessionRequest(ctx, http.MethodGet, authToken, instanceID)
+	return c.doSessionRequest(ctx, http.MethodGet, authToken, instanceID, "")
 }
 
 func (c *UpstreamClient) EndSession(ctx context.Context, authToken string) error {
-	requestURL, err := url.JoinPath(c.baseURL, "/api/v1/freebuff/session")
+	cfg := c.cfgStore.Current()
+	requestURL, err := url.JoinPath(cfg.UpstreamBaseURL, "/api/v1/freebuff/session")
 	if err != nil {
 		return fmt.Errorf("build free session url: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
+	requestCtx, cancel := c.requestContext(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodDelete, requestURL, nil)
 	if err != nil {
 		return fmt.Errorf("create free session delete request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("User-Agent", cfg.UserAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -324,8 +458,9 @@ func (c *UpstreamClient) EndSession(ctx context.Context, authToken string) error
 	return nil
 }
 
-func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken, instanceID string) (freeSessionResponse, error) {
-	requestURL, err := url.JoinPath(c.baseURL, "/api/v1/freebuff/session")
+func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken, instanceID, model string) (freeSessionResponse, error) {
+	cfg := c.cfgStore.Current()
+	requestURL, err := url.JoinPath(cfg.UpstreamBaseURL, "/api/v1/freebuff/session")
 	if err != nil {
 		return freeSessionResponse{}, fmt.Errorf("build free session url: %w", err)
 	}
@@ -335,15 +470,21 @@ func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken
 		body = bytes.NewReader([]byte("{}"))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, requestURL, body)
+	requestCtx, cancel := c.requestContext(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, method, requestURL, body)
 	if err != nil {
 		return freeSessionResponse{}, fmt.Errorf("create free session request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("User-Agent", cfg.UserAgent)
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
+		if strings.TrimSpace(model) != "" {
+			req.Header.Set("x-freebuff-model", strings.TrimSpace(model))
+		}
 	}
 	if method == http.MethodGet && instanceID != "" {
 		req.Header.Set("x-freebuff-instance-id", instanceID)
@@ -411,4 +552,13 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func firstNonEmptyTrimmedString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }

@@ -2,6 +2,7 @@
   "LISTEN_ADDR": ":8080",
   "UPSTREAM_BASE_URL": "https://www.codebuff.com",
   "AUTH_TOKENS": [],
+  "AUTH_TOKEN_DIR": "",
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "15m",
   "API_KEYS": [],

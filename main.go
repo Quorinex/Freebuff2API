@@ -13,19 +13,17 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "", "path to a JSON config file (default: config.json if present)")
+	configPath := flag.String("config", "", "path to a YAML or JSON config file")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "[Freebuff2API] ", log.LstdFlags|log.Lmsgprefix)
 
-	// Auto-detect config.json in CWD when no flag is given
-	if *configPath == "" {
-		if _, err := os.Stat("config.json"); err == nil {
-			*configPath = "config.json"
-		}
+	resolvedConfigPath, err := resolveConfigPath(*configPath)
+	if err != nil {
+		logger.Fatalf("resolve config path: %v", err)
 	}
 
-	cfg, err := loadConfig(*configPath)
+	cfg, err := loadConfig(resolvedConfigPath)
 	if err != nil {
 		logger.Fatalf("load config: %v", err)
 	}
@@ -36,7 +34,7 @@ func main() {
 		transport.Proxy = http.ProxyURL(importURL)
 	}
 	httpClient := &http.Client{Transport: transport, Timeout: 15 * time.Second}
-	
+
 	registry := NewModelRegistry(httpClient, logger)
 	registry.Start(context.Background())
 	defer registry.Stop()
@@ -45,6 +43,10 @@ func main() {
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
 	server.Start(runCtx)
+
+	reloader := NewConfigReloader(cfg, logger, server.ApplyConfig)
+	reloader.Start()
+	defer reloader.Stop()
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
